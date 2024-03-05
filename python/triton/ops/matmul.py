@@ -85,7 +85,7 @@ def get_configs_io_bound():
     'EVEN_K': lambda args: args['K'] % (args['BLOCK_K'] * args['SPLIT_K']) == 0,
 })
 @jit
-def _kernel(A, B, C, M, N, K,  #
+def _kernel(a_ptr, b_ptr, c_ptr, M, N, K,  #
             stride_am, stride_ak,  #
             stride_bk, stride_bn,  #
             stride_cm, stride_cn,  #
@@ -93,30 +93,36 @@ def _kernel(A, B, C, M, N, K,  #
             allow_tf32: tl.constexpr,  #
             fp8_fast_accum: tl.constexpr,  #
             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  #
-            GROUP_M: tl.constexpr, SPLIT_K: tl.constexpr, EVEN_K: tl.constexpr, AB_DTYPE: tl.constexpr  #
+            GROUP_M: tl.constexpr, SPLIT_K: tl.constexpr, EVEN_K: tl.constexpr, AB_DTYPE: tl.constexpr,  #
+            NUM_SMS: tl.constexpr
             ):
     # matrix multiplication
-    pid = tl.program_id(0)
+    pid = tl.program_id(0) # start_tile
     pid_z = tl.program_id(1)
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_n = tl.cdiv(N, BLOCK_N)
-    # re-order program ID for better L2 performance
+    grid_m = tl.cdiv(M, BLOCK_M) # m_tiles
+    grid_n = tl.cdiv(N, BLOCK_N) # n_tiles
+    num_tiles = grid_m * grid_n
     width = GROUP_M * grid_n
-    group_id = pid // width
-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (pid % group_size)
-    pid_n = (pid % width) // (group_size)
-    # do matrix multiplication
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-    rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
     rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
-    # pointers
-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
-    for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+    for tile_id in range(pid, num_tiles, NUM_SMS):
+      # re-order program ID for better L2 performance
+      group_id = tile_id // width
+      group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+      pid_m = group_id * GROUP_M + (tile_id % group_size)
+      pid_n = (tile_id % width) // (group_size)
+      # without reordering
+      #pid_m = tile_id // grid_n
+      #pid_n = tile_id % grid_n
+      # do matrix multiplication
+      rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+      rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+      ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+      rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+      # pointers
+      A = a_ptr + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+      B = b_ptr + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
+      acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
+      for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
         if EVEN_K:
             a = tl.load(A)
             b = tl.load(B)
@@ -134,16 +140,17 @@ def _kernel(A, B, C, M, N, K,  #
             acc += tl.dot(a, b, out_dtype=acc_dtype, allow_tf32=allow_tf32)
         A += BLOCK_K * SPLIT_K * stride_ak
         B += BLOCK_K * SPLIT_K * stride_bk
-    acc = acc.to(C.dtype.element_ty)
-    # rematerialize rm and rn to save registers
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
-    mask = (rm < M)[:, None] & (rn < N)[None, :]
-    # handles write-back with reduction-splitting
-    if SPLIT_K == 1:
+      acc = acc.to(c_ptr.dtype.element_ty)
+      # rematerialize rm and rn to save registers
+      rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+      rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+      C = c_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+      # do we need the mask here?
+      mask = (rm < M)[:, None] & (rn < N)[None, :]
+      # handles write-back with reduction-splitting
+      if SPLIT_K == 1:
         tl.store(C, acc, mask=mask)
-    else:
+      else:
         tl.atomic_add(C, acc, mask=mask)
 
 
@@ -186,6 +193,7 @@ class _matmul(torch.autograd.Function):
             assert isinstance(acc_dtype, torch.dtype), "acc_dtype must be a torch.dtype"
             assert acc_dtype in supported_acc_dtypes[a.dtype], "acc_dtype not compatible with the type of a"
             assert acc_dtype in supported_acc_dtypes[b.dtype], "acc_dtype not compatible with the type of b"
+        #print(acc_dtype, ab_dtype, output_dtype)
 
         def to_tl_type(ty):
             return getattr(tl, str(ty).split(".")[-1])
@@ -197,9 +205,13 @@ class _matmul(torch.autograd.Function):
         # Tensor cores support input with mixed float8 types.
         if a.dtype in [tl.float8e4nv, tl.float8e5] and b.dtype in [tl.float8e4nv, tl.float8e5]:
             ab_dtype = None
+        #print("acc_dtype", acc_dtype, allow_tf32, fp8_fast_accum, ab_dtype, output_dtype, a.dtype, b.dtype, c.dtype)
         # launch kernel
-        grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), META['SPLIT_K'])
-        _kernel[grid](
+        NUM_SMS = torch.cuda.get_device_properties('cuda').multi_processor_count
+        grid = lambda META: (min(META['NUM_SMS'], cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N'])), META['SPLIT_K'])
+        #grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), META['SPLIT_K'])
+        print("NUM_SMS", NUM_SMS)
+        kernel_info = _kernel[grid](
             a, b, c, M, N, K,  #
             a.stride(0), a.stride(1),  #
             b.stride(0), b.stride(1),  #
@@ -207,7 +219,11 @@ class _matmul(torch.autograd.Function):
             acc_dtype=acc_dtype,  #
             allow_tf32=allow_tf32,  #
             fp8_fast_accum=fp8_fast_accum,  #
-            GROUP_M=8, AB_DTYPE=ab_dtype)
+            GROUP_M=8, AB_DTYPE=ab_dtype, NUM_SMS=NUM_SMS)
+        for ir in ["ttir", "ttgir", "llir", "ptx"]:
+            kname = kernel_info.metadata.name + "_" + kernel_info.metadata.hash
+            with open(f"{kname}_{ir}.txt", "w") as f:
+                f.write(kernel_info.asm[ir])
         return c
 
     @staticmethod

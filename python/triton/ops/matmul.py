@@ -35,51 +35,62 @@ def init_to_zero(name):
 
 def get_configs_io_bound():
     configs = []
-    for num_stages in [2, 3, 4, 5, 6]:
-        for block_m in [16, 32]:
-            for block_k in [32, 64]:
-                for block_n in [32, 64, 128, 256]:
-                    num_warps = 2 if block_n <= 64 else 4
-                    configs.append(
+    for num_stages in [3,4,5]:#[2, 3, 4, 5, 6]:
+        for block_m in [128, 256]: #16, 32, 64
+            for block_k in [64, 128, 256]:
+                for block_n in [128, 256]:
+                    for num_warps in [4, 8]: # 4, 8 for no WS, 4 for WS
+                      #num_warps = 4 #2 if block_n <= 64 else 4
+                      configs.append(
                         Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': 1},
-                               num_stages=num_stages, num_warps=num_warps))
-                    # split_k
-                    for split_k in [2, 4, 8, 16]:
-                        configs.append(
-                            Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': split_k},
-                                   num_stages=num_stages, num_warps=num_warps, pre_hook=init_to_zero('C')))
+                               num_stages=num_stages, num_warps=num_warps, enable_warp_specialization=False))
+                      #if num_warps == 4:
+                      #  configs.append(
+                      #    Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': 1},
+                      #           num_stages=num_stages, num_warps=num_warps, enable_warp_specialization=True))
+                      # split_k
+                      #for split_k in [2, 4, 8, 16]:
+                      #  configs.append(
+                      #      Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': split_k},
+                      #             num_stages=num_stages, num_warps=num_warps, enable_warp_specialization=False, pre_hook=init_to_zero('C')))
     return configs
 
 
 @autotune(
     configs=[
         # basic configs for compute-bound matmuls
-        Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=5, num_warps=2),
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=5, num_warps=2, enable_warp_specialization=False),
         # good for int8
-        Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=5, num_warps=2),
+        # below is the best for size 10240
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=3, num_warps=8, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=3, num_warps=4, enable_warp_specialization=True),
+
+        #Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=3, num_warps=8, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        # below is the best for size 10240 if ignoring num_warps of 8
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=True),
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=8, enable_warp_specialization=False),
+
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4, enable_warp_specialization=False),
+        #Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=5, num_warps=2, enable_warp_specialization=False),
     ] + get_configs_io_bound(),
     key=['M', 'N', 'K'],
-    prune_configs_by={
-        'early_config_prune': early_config_prune,
-        'perf_model': estimate_matmul_time,
-        'top_k': 10,
-    },
+    #prune_configs_by={
+    #    'early_config_prune': early_config_prune,
+    #    'perf_model': estimate_matmul_time,
+    #    'top_k': 10,
+    #},
 )
 @heuristics({
     'EVEN_K': lambda args: args['K'] % (args['BLOCK_K'] * args['SPLIT_K']) == 0,
@@ -96,35 +107,55 @@ def _kernel(A, B, C, M, N, K,  #
             GROUP_M: tl.constexpr, SPLIT_K: tl.constexpr, EVEN_K: tl.constexpr, AB_DTYPE: tl.constexpr  #
             ):
     # matrix multiplication
-    pid = tl.program_id(0)
+    pid = tl.program_id(0) # start_tile
     pid_z = tl.program_id(1)
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_n = tl.cdiv(N, BLOCK_N)
+    grid_m = tl.cdiv(M, BLOCK_M) # m_tiles
+    grid_n = tl.cdiv(N, BLOCK_N) # n_tiles
+    num_tiles = grid_m * grid_n
     # re-order program ID for better L2 performance
     width = GROUP_M * grid_n
     group_id = pid // width
     group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
     pid_m = group_id * GROUP_M + (pid % group_size)
     pid_n = (pid % width) // (group_size)
+    # without reordering
+    #pid_m = pid // grid_n
+    #pid_n = pid % grid_n
+
     # do matrix multiplication
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-    rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-    rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
-    # pointers
-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
+    block_offset_m = pid_m * BLOCK_M
+    block_offset_n = pid_n * BLOCK_N
+
+    a_tile_ptr = tl.make_block_ptr(base=A, shape=(M, K), strides=(stride_am, stride_ak),
+                                   offsets=(block_offset_m, 0), block_shape=(BLOCK_M, BLOCK_K),
+                                   order=(1, 0))
+    b_tile_ptr = tl.make_block_ptr(base=B, shape=(K, N), strides=(stride_bk, stride_bn),
+                                   offsets=(0, block_offset_n), block_shape=(BLOCK_K, BLOCK_N),
+                                   order=(1, 0))
+
+    # original address calculation
+    #rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    #rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    #ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    #rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
+    #rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+    ## pointers
+    #A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+    #B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
-    for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
-        if EVEN_K:
-            a = tl.load(A)
-            b = tl.load(B)
-        else:
-            k_remaining = K - k * (BLOCK_K * SPLIT_K)
-            _0 = tl.zeros((1, 1), dtype=C.dtype.element_ty)
-            a = tl.load(A, mask=rk[None, :] < k_remaining, other=_0)
-            b = tl.load(B, mask=rk[:, None] < k_remaining, other=_0)
+    #for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+    for k in range(0, K, BLOCK_K): # assume SPILT_K is 1, EVEN_K is 1
+        #if EVEN_K:
+        #    a = tl.load(A)
+        #    b = tl.load(B)
+        #else:
+        #    k_remaining = K - k * (BLOCK_K * SPLIT_K)
+        #    _0 = tl.zeros((1, 1), dtype=C.dtype.element_ty)
+        #    a = tl.load(A, mask=rk[None, :] < k_remaining, other=_0)
+        #    b = tl.load(B, mask=rk[:, None] < k_remaining, other=_0)
+        a = tl.load(a_tile_ptr)
+        b = tl.load(b_tile_ptr)
         if AB_DTYPE is not None:
             a = a.to(AB_DTYPE)
             b = b.to(AB_DTYPE)
@@ -132,8 +163,10 @@ def _kernel(A, B, C, M, N, K,  #
             acc = tl.dot(a, b, acc, out_dtype=acc_dtype, allow_tf32=allow_tf32)
         else:
             acc += tl.dot(a, b, out_dtype=acc_dtype, allow_tf32=allow_tf32)
-        A += BLOCK_K * SPLIT_K * stride_ak
-        B += BLOCK_K * SPLIT_K * stride_bk
+        #A += BLOCK_K * SPLIT_K * stride_ak
+        #B += BLOCK_K * SPLIT_K * stride_bk
+        a_tile_ptr = tl.advance(a_tile_ptr, [0, BLOCK_K])
+        b_tile_ptr = tl.advance(b_tile_ptr, [BLOCK_K, 0])
     acc = acc.to(C.dtype.element_ty)
     # rematerialize rm and rn to save registers
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -186,6 +219,7 @@ class _matmul(torch.autograd.Function):
             assert isinstance(acc_dtype, torch.dtype), "acc_dtype must be a torch.dtype"
             assert acc_dtype in supported_acc_dtypes[a.dtype], "acc_dtype not compatible with the type of a"
             assert acc_dtype in supported_acc_dtypes[b.dtype], "acc_dtype not compatible with the type of b"
+        #print(acc_dtype, ab_dtype, output_dtype)
 
         def to_tl_type(ty):
             return getattr(tl, str(ty).split(".")[-1])
@@ -197,9 +231,12 @@ class _matmul(torch.autograd.Function):
         # Tensor cores support input with mixed float8 types.
         if a.dtype in [tl.float8e4nv, tl.float8e5] and b.dtype in [tl.float8e4nv, tl.float8e5]:
             ab_dtype = None
+        #print("acc_dtype", acc_dtype, allow_tf32, fp8_fast_accum, ab_dtype, output_dtype, a.dtype, b.dtype, c.dtype)
         # launch kernel
+        #NUM_SMS = torch.cuda.get_device_properties('cuda').multi_processor_count
+        #grid = lambda META: (min(META['NUM_SMS'], triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N'])), META['SPLIT_K'])
         grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), META['SPLIT_K'])
-        _kernel[grid](
+        kernel_info = _kernel[grid](
             a, b, c, M, N, K,  #
             a.stride(0), a.stride(1),  #
             b.stride(0), b.stride(1),  #
@@ -208,6 +245,10 @@ class _matmul(torch.autograd.Function):
             allow_tf32=allow_tf32,  #
             fp8_fast_accum=fp8_fast_accum,  #
             GROUP_M=8, AB_DTYPE=ab_dtype)
+        for ir in ["ttir", "ttgir", "llir", "ptx"]:
+            kname = kernel_info.metadata.name + "_" + kernel_info.metadata.hash
+            with open(f"{kname}_{ir}.txt", "w") as f:
+                f.write(kernel_info.asm[ir])
         return c
 
     @staticmethod

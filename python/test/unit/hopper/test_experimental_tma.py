@@ -128,3 +128,64 @@ def test_experimental_tma_matmul(num_stages, BLOCK_M, BLOCK_N, BLOCK_K):
     torch.testing.assert_close(ref_out, C, rtol=1e-3, atol=1e-3)
     if BLOCK_M >= 64 and BLOCK_N >= 64:
         assert "stmatrix.sync.aligned.m8n8.x4.shared.b16" in kernel.asm["ptx"]
+
+
+def test_experimetal_descriptor_load_3d():
+    if not torch.cuda.is_available() or not torch.cuda.get_device_capability()[0] == 9:
+        pytest.skip("Test requires Hopper target.")
+        return
+    device = "cuda"
+    L = 128
+    heads = 16
+    attn_dim = 8
+    hidden_dim = 4
+    BLOCK_L = 16
+    BLOCK_H = 4
+    BLOCK_D = 2
+
+    @triton.jit
+    def kernel_tma(Z, desc, BLOCK_L: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr):
+        off_0 = tl.arange(0, BLOCK_L)
+        off_1 = tl.arange(0, BLOCK_H)
+        off_2 = tl.arange(0, BLOCK_D)
+        off = off_0[:, None, None] + off_1[None, :, None] + off_2[None, None, :]
+        x = tl._experimental_descriptor_load(desc, [3, 2, 1], [BLOCK_L, BLOCK_H, BLOCK_D], Z.dtype.element_ty)
+        tl.store(Z + off, x)
+
+    @triton.jit
+    def kernel(Z, V, stride_0, stride_1, stride_2, BLOCK_L: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr):
+        V_block_ptr = tl.make_block_ptr(
+            base=V,
+            shape=(128, 16, 4),
+            strides=(stride_0, stride_1, stride_2),
+            offsets=(3, 2, 1),
+            block_shape=(BLOCK_L, BLOCK_H, BLOCK_D),
+            order=(1, 0),
+        )
+        off_0 = tl.arange(0, BLOCK_L)
+        off_1 = tl.arange(0, BLOCK_H)
+        off_2 = tl.arange(0, BLOCK_D)
+        off = off_0[:, None, None] + off_1[None, :, None] + off_2[None, None, :]
+        v = tl.load(V_block_ptr)
+        tl.store(Z + off, v)
+
+    x = torch.randn((L, heads, attn_dim * 2 + hidden_dim), dtype=torch.float32, device=device)
+    # size of k: 128, 16, 8, strides: 128*16*(8*2+4)*4, 16*(8*2+4)*4, (8*2+4)*4, 1
+    # why are globalStrides dims[0]*elementSize, dims[0]*dims[1]*elementSize for 2D?
+    q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
+    # create descriptor
+    TMA_SIZE = 128
+    desc = np.empty(TMA_SIZE, dtype=np.int8)
+    dimSize = attn_dim * 2 + hidden_dim  # 20
+    elemSize = x.element_size()
+    triton.runtime.driver.active.utils.fill_3d_tma_descriptor(v.data_ptr(), L, heads, attn_dim, BLOCK_L, BLOCK_H,
+                                                              BLOCK_D, L * heads * dimSize * elemSize,
+                                                              heads * dimSize * elemSize, dimSize * elemSize,
+                                                              x.element_size(), desc)
+    desc = torch.tensor(desc, device=device)
+    # output
+    z_tri = torch.empty((BLOCK_L, BLOCK_H, BLOCK_D), dtype=torch.float32, device=device)
+    kernel_tma[(1, )](z_tri, desc, BLOCK_L, BLOCK_H, BLOCK_D, num_warps=4)
+    z_no_tma = torch.empty((BLOCK_L, BLOCK_H, BLOCK_D), dtype=torch.float32, device=device)
+    kernel[(1, )](z_no_tma, v, v.stride(0), v.stride(1), v.stride(2), num_warps=4)
+    assert torch.equal(z_no_tma, z_tri)

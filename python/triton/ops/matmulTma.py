@@ -54,6 +54,7 @@ def get_configs_io_bound():
 @triton.autotune(
     configs=[  #BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 64
         Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, ),
+        Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128}, ),
     ],
     key=['M', 'N', 'K'],
 )
@@ -127,7 +128,7 @@ class _matmulTma(torch.autograd.Function):
         assert a.shape[1] == b.shape[0], "incompatible dimensions"
         M, K = a.shape
         _, N = b.shape
-        print("M N K", M, N, K, b.stride(0), b.stride(1))
+        #print("M N K", M, N, K, b.stride(0), b.stride(1))
 
         # common type between a and b
         ab_dtype = get_higher_dtype(a.dtype, b.dtype)
@@ -139,9 +140,14 @@ class _matmulTma(torch.autograd.Function):
         c = torch.empty((M, N), device=device, dtype=output_dtype)
 
         TMA_SIZE = 128
+        '''
         desc_a = torch.empty((TMA_SIZE), dtype=torch.int8)  # if we start with cuda, will hit illegal
         desc_b = torch.empty((TMA_SIZE), dtype=torch.int8)
         desc_c = torch.empty((TMA_SIZE), dtype=torch.int8)
+        '''
+        desc_a = torch.empty((TMA_SIZE), device="cuda", dtype=torch.int8)
+        desc_b = torch.empty((TMA_SIZE), device="cuda", dtype=torch.int8)
+        desc_c = torch.empty((TMA_SIZE), device="cuda", dtype=torch.int8)
         '''
         BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 64
         desc_a = desc_a.cpu().numpy()
@@ -178,20 +184,27 @@ class _matmulTma(torch.autograd.Function):
             nonlocal desc_a
             nonlocal desc_b
             nonlocal desc_c
-            desc_a = desc_a.numpy()  # if start with cuda, will need cpu() here
-            desc_b = desc_b.numpy()
-            desc_c = desc_c.numpy()
-            print("enter grid2", META['BLOCK_M'], META['BLOCK_K'])
+            #a_buf = torch.empty(TMA_SIZE, dtype=torch.int8)
+            a_buf = torch.empty_like(desc_a, device="cpu")
+            b_buf = torch.empty_like(desc_b, device="cpu")
+            c_buf = torch.empty_like(desc_c, device="cpu")
+            #desc_a = desc_a.numpy()  # if start with cuda, will need cpu() here
+            #desc_b = desc_b.numpy()
+            #desc_c = desc_c.numpy()
+            #print("enter grid2", META['BLOCK_M'], META['BLOCK_K'])
             triton.runtime.driver.active.utils.fill_2d_tma_descriptor(a.data_ptr(), M, K, META['BLOCK_M'],
-                                                                      META['BLOCK_K'], a.element_size(), desc_a)
+                                                                      META['BLOCK_K'], a.element_size(), a_buf.numpy())
             # 2nd input is pre-transposed, so load as N, K and BLOCK_N BLOCK_K
             triton.runtime.driver.active.utils.fill_2d_tma_descriptor(b.data_ptr(), N, K, META['BLOCK_N'],
-                                                                      META['BLOCK_K'], b.element_size(), desc_b)
+                                                                      META['BLOCK_K'], b.element_size(), b_buf.numpy())
             triton.runtime.driver.active.utils.fill_2d_tma_descriptor(c.data_ptr(), M, N, META['BLOCK_M'],
-                                                                      META['BLOCK_N'], c.element_size(), desc_c)
-            desc_a = torch.tensor(desc_a, device="cuda")
-            desc_b = torch.tensor(desc_b, device="cuda")
-            desc_c = torch.tensor(desc_c, device="cuda")
+                                                                      META['BLOCK_N'], c.element_size(), c_buf.numpy())
+            #desc_a = torch.tensor(desc_a, device="cuda")
+            #desc_b = torch.tensor(desc_b, device="cuda")
+            #desc_c = torch.tensor(desc_c, device="cuda")
+            desc_a.copy_(a_buf)
+            desc_b.copy_(b_buf)
+            desc_c.copy_(c_buf)
             return (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), 1, 1)  #META['SPLIT_K'])
 
         def enter_autotune(args, reset_only=False):
@@ -205,38 +218,38 @@ class _matmulTma(torch.autograd.Function):
             desc_a = args["a_desc_ptr"]
             desc_b = args["a_desc_ptr"]
             desc_c = args["a_desc_ptr"]
-            desc_a = desc_a.cpu().numpy()
-            desc_b = desc_b.cpu().numpy()
-            desc_c = desc_c.cpu().numpy()
+            a_buf = torch.empty_like(desc_a, device="cpu")
+            b_buf = torch.empty_like(desc_b, device="cpu")
+            c_buf = torch.empty_like(desc_c, device="cpu")
             triton.runtime.driver.active.utils.fill_2d_tma_descriptor(a.data_ptr(), args["M"],
                                                                       args["K"], args['BLOCK_M'], args['BLOCK_K'],
-                                                                      a.element_size(), desc_a)
+                                                                      a.element_size(), a_buf.numpy())
             # 2nd input is pre-transposed, so load as N, K and BLOCK_N BLOCK_K
             triton.runtime.driver.active.utils.fill_2d_tma_descriptor(b.data_ptr(), args["N"],
                                                                       args["K"], args['BLOCK_N'], args['BLOCK_K'],
-                                                                      b.element_size(), desc_b)
+                                                                      b.element_size(), a_buf.numpy())
             triton.runtime.driver.active.utils.fill_2d_tma_descriptor(c.data_ptr(), args["M"],
                                                                       args["N"], args['BLOCK_M'], args['BLOCK_N'],
-                                                                      c.element_size(), desc_c)
-            desc_a = torch.tensor(desc_a, device="cuda")
-            desc_b = torch.tensor(desc_b, device="cuda")
-            desc_c = torch.tensor(desc_c, device="cuda")
+                                                                      c.element_size(), a_buf.numpy())
+            desc_a.copy_(a_buf)
+            desc_b.copy_(b_buf)
+            desc_c.copy_(c_buf)
 
         acc_dtype = to_tl_type(acc_dtype)
         ab_dtype = to_tl_type(ab_dtype)
         output_dtype = to_tl_type(output_dtype)
         #a_dtype = to_tl_type(a.dtype)
-        print("acc_dtype", str(acc_dtype), "ab_dtype", str(ab_dtype), "output_dtype", str(output_dtype), "a_dtype",
-              str(a.dtype))
-        print("strdies", a.stride(0), a.stride(1), b.stride(0), b.stride(1),  #
-              c.stride(0), c.stride(1))
+        #print("acc_dtype", str(acc_dtype), "ab_dtype", str(ab_dtype), "output_dtype", str(output_dtype), "a_dtype",
+        #      str(a.dtype))
+        #print("strdies", a.stride(0), a.stride(1), b.stride(0), b.stride(1),  #
+        #      c.stride(0), c.stride(1))
 
         # Tensor cores support input with mixed float8 types.
         if a.dtype in [tl.float8e4nv, tl.float8e5] and b.dtype in [tl.float8e4nv, tl.float8e5]:
             ab_dtype = None
         #_kernel.pre_hook = enter_autotune
         # launch kernel: directly, with grid, with grid2
-        # grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), 1, 1)
+        #grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), 1, 1)
         #_kernel[cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N), 1, 1](
         _kernel[grid2](
             a, b, c, desc_a, desc_b, desc_c, M, N, K,  #

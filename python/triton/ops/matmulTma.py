@@ -1,8 +1,9 @@
 import torch
+import triton
+import numpy as np
 
-from .. import Config, autotune, cdiv, heuristics, jit
+from .. import Config, cdiv, jit
 from .. import language as tl
-from .matmul_perf_model import early_config_prune, estimate_matmul_time
 
 _ordered_datatypes = [torch.int8, torch.float16, torch.bfloat16, torch.float32]
 
@@ -43,14 +44,15 @@ def get_configs_io_bound():
                     configs.append(
                         Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': 1},
                                num_stages=num_stages, num_warps=num_warps))
-                    # split_k
-                    for split_k in [2, 4, 8, 16]:
-                        configs.append(
-                            Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': split_k},
-                                   num_stages=num_stages, num_warps=num_warps, pre_hook=init_to_zero('C')))
+                    # split_k (can't support splitk with tma store.
+                    #for split_k in [2, 4, 8, 16]:
+                    #    configs.append(
+                    #        Config({'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k, 'SPLIT_K': split_k},
+                    #               num_stages=num_stages, num_warps=num_warps, pre_hook=init_to_zero('C')))
     return configs
 
 
+'''
 @autotune(
     configs=[
         # basic configs for compute-bound matmuls
@@ -73,31 +75,25 @@ def get_configs_io_bound():
         Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
         Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
         Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=5, num_warps=2),
-    ] + get_configs_io_bound(),
+    ], #+ get_configs_io_bound(),
     key=['M', 'N', 'K'],
-    prune_configs_by={
-        'early_config_prune': early_config_prune,
-        'perf_model': estimate_matmul_time,
-        'top_k': 10,
-    },
 )
 @heuristics({
     'EVEN_K': lambda args: args['K'] % (args['BLOCK_K'] * args['SPLIT_K']) == 0,
 })
+'''
+
+
 @jit
-def _kernel(A, B, C, M, N, K,  #
-            stride_am, stride_ak,  #
-            stride_bk, stride_bn,  #
-            stride_cm, stride_cn,  #
+def _kernel(A, B, C, a_desc_ptr, b_desc_ptr, c_desc_ptr, M, N, K,  #
             acc_dtype: tl.constexpr,  #
             input_precision: tl.constexpr,  #
             fp8_fast_accum: tl.constexpr,  #
             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  #
-            GROUP_M: tl.constexpr, SPLIT_K: tl.constexpr, EVEN_K: tl.constexpr, AB_DTYPE: tl.constexpr  #
-            ):
+            GROUP_M: tl.constexpr, SPLIT_K: tl.constexpr, AB_DTYPE: tl.constexpr):
     # matrix multiplication
     pid = tl.program_id(0)
-    pid_z = tl.program_id(1)
+    #pid_z = tl.program_id(1)
     grid_m = tl.cdiv(M, BLOCK_M)
     grid_n = tl.cdiv(N, BLOCK_N)
     # re-order program ID for better L2 performance
@@ -107,24 +103,20 @@ def _kernel(A, B, C, M, N, K,  #
     pid_m = group_id * GROUP_M + (pid % group_size)
     pid_n = (pid % width) // (group_size)
     # do matrix multiplication
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
-    rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-    rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_am = pid_m * BLOCK_M
+    offs_bn = pid_n * BLOCK_N
+    offs_k = 0
+    #rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    #rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    #ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
+    #rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
     # pointers
-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
-    B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
     for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
-        if EVEN_K:
-            a = tl.load(A)
-            b = tl.load(B)
-        else:
-            k_remaining = K - k * (BLOCK_K * SPLIT_K)
-            _0 = tl.zeros((1, 1), dtype=C.dtype.element_ty)
-            a = tl.load(A, mask=rk[None, :] < k_remaining, other=_0)
-            b = tl.load(B, mask=rk[:, None] < k_remaining, other=_0)
+        a = tl._experimental_descriptor_load(a_desc_ptr, [offs_am, offs_k], [BLOCK_M, BLOCK_K], A.dtype.element_ty)
+        b = tl._experimental_descriptor_load(b_desc_ptr, [offs_bn, offs_k], [BLOCK_N, BLOCK_K],
+                                             B.dtype.element_ty)  #tl.float8e4nv) #INPUT_DTYPE)
+        b = tl.trans(b)
         if AB_DTYPE is not None:
             a = a.to(AB_DTYPE)
             b = b.to(AB_DTYPE)
@@ -132,22 +124,20 @@ def _kernel(A, B, C, M, N, K,  #
             acc = tl.dot(a, b, acc, out_dtype=acc_dtype, input_precision=input_precision)
         else:
             acc += tl.dot(a, b, out_dtype=acc_dtype, input_precision=input_precision)
-        A += BLOCK_K * SPLIT_K * stride_ak
-        B += BLOCK_K * SPLIT_K * stride_bk
+        offs_k += BLOCK_K
     acc = acc.to(C.dtype.element_ty)
     # rematerialize rm and rn to save registers
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
-    mask = (rm < M)[:, None] & (rn < N)[None, :]
+    #rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    #rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    #mask = (rm < M)[:, None] & (rn < N)[None, :]
     # handles write-back with reduction-splitting
     if SPLIT_K == 1:
-        tl.store(C, acc, mask=mask)
-    else:
-        tl.atomic_add(C, acc, mask=mask)
+        tl._experimental_descriptor_store(c_desc_ptr, acc, [offs_am, offs_bn])
+    #else:
+    #    tl.atomic_add(C, acc, mask=mask)
 
 
-class _matmul(torch.autograd.Function):
+class _matmulTma(torch.autograd.Function):
     kernel = _kernel
 
     _locks = {}
@@ -175,6 +165,22 @@ class _matmul(torch.autograd.Function):
 
         c = torch.empty((M, N), device=device, dtype=output_dtype)
 
+        TMA_SIZE = 128
+        desc_a = np.empty(TMA_SIZE, dtype=np.int8)
+        desc_b = np.empty(TMA_SIZE, dtype=np.int8)
+        desc_c = np.empty(TMA_SIZE, dtype=np.int8)
+        #'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 64
+        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(a.data_ptr(), M, K, BLOCK_M, BLOCK_K,
+                                                                  a.element_size(), desc_a)
+        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(b.data_ptr(), N, K, BLOCK_N, BLOCK_K,
+                                                                  b.element_size(), desc_b)
+        triton.runtime.driver.active.utils.fill_2d_tma_descriptor(c.data_ptr(), M, N, BLOCK_M, BLOCK_N,
+                                                                  c.element_size(), desc_c)
+        desc_a = torch.tensor(desc_a, device=a.device)
+        desc_b = torch.tensor(desc_b, device=a.device)
+        desc_c = torch.tensor(desc_c, device=a.device)
+
         # Allowed types for acc_type given the types of a and b.
         supported_acc_dtypes = {
             torch.float16: (torch.float32, torch.float16), torch.bfloat16: (torch.float32, torch.bfloat16),
@@ -191,30 +197,59 @@ class _matmul(torch.autograd.Function):
         def to_tl_type(ty):
             return getattr(tl, str(ty).split(".")[-1])
 
+        def grid(META):
+            nonlocal desc_a
+            nonlocal desc_b
+            nonlocal desc_c
+            triton.runtime.driver.active.utils.fill_2d_tma_descriptor(a.data_ptr(), M, K, META['BLOCK_M'],
+                                                                      META['BLOCK_K'], a.element_size(), desc_a)
+            # 2nd input is pre-transposed, so load as N, K and BLOCK_N BLOCK_K
+            triton.runtime.driver.active.utils.fill_2d_tma_descriptor(b.data_ptr(), N, K, META['BLOCK_N'],
+                                                                      META['BLOCK_K'], b.element_size(), desc_b)
+            triton.runtime.driver.active.utils.fill_2d_tma_descriptor(c.data_ptr(), M, N, META['BLOCK_M'],
+                                                                      META['BLOCK_N'], c.element_size(), desc_c)
+            desc_a = torch.tensor(desc_a, device=a.device)
+            desc_b = torch.tensor(desc_b, device=a.device)
+            desc_c = torch.tensor(desc_c, device=a.device)
+            return (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), META['SPLIT_K'])
+
         acc_dtype = to_tl_type(acc_dtype)
         ab_dtype = to_tl_type(ab_dtype)
         output_dtype = to_tl_type(output_dtype)
+        #a_dtype = to_tl_type(a.dtype)
+        print("acc_dtype", str(acc_dtype), "ab_dtype", str(ab_dtype), "output_dtype", str(output_dtype), "a_dtype",
+              str(a.dtype))
+        print("strdies", a.stride(0), a.stride(1), b.stride(0), b.stride(1),  #
+              c.stride(0), c.stride(1))
 
         # Tensor cores support input with mixed float8 types.
         if a.dtype in [tl.float8e4nv, tl.float8e5] and b.dtype in [tl.float8e4nv, tl.float8e5]:
             ab_dtype = None
         # launch kernel
-        grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), META['SPLIT_K'])
-        _kernel[grid](
-            a, b, c, M, N, K,  #
-            a.stride(0), a.stride(1),  #
-            b.stride(0), b.stride(1),  #
-            c.stride(0), c.stride(1),  #
+        #grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), META['SPLIT_K'])
+        _kernel[cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N), 1, 1](
+            a, b, c, desc_a, desc_b, desc_c, M, N, K,  #
             acc_dtype=acc_dtype,  #
             input_precision=input_precision,  #
             fp8_fast_accum=fp8_fast_accum,  #
-            GROUP_M=8, AB_DTYPE=ab_dtype)
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=8, SPLIT_K=1, AB_DTYPE=ab_dtype)
+
+        # Print autotune result, i.e, best config
+        #print(kernel_info.metadata)
+        #print("num_stages=", kernel_info.metadata.num_stages)
+        #print("num_warps=", kernel_info.metadata.num_warps)
+        #print(kernel_info.src.constants)
+
+        # Dump all IR for NVIDIA GPUs.
+        #for ir in ["ttir", "ttgir", "llir", "ptx"]:
+        #    with open(f"{ir}.txt", "w") as f:
+        #        f.write(kernel_info.asm[ir])
         return c
 
     @staticmethod
     def forward(ctx, a, b, acc_dtype=None, input_precision=None, fp8_fast_accum=True, output_dtype=None):
-        return _matmul._call(a, b, acc_dtype=acc_dtype, input_precision=input_precision, fp8_fast_accum=fp8_fast_accum,
-                             output_dtype=output_dtype)
+        return _matmulTma._call(a, b, acc_dtype=acc_dtype, input_precision=input_precision,
+                                fp8_fast_accum=fp8_fast_accum, output_dtype=output_dtype)
 
 
-matmul = _matmul.apply
+matmulTma = _matmulTma.apply

@@ -52,38 +52,12 @@ def get_configs_io_bound():
     return configs
 
 
-'''
-@autotune(
-    configs=[
-        # basic configs for compute-bound matmuls
-        Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_stages=5, num_warps=2),
-        # good for int8
-        Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=3, num_warps=8),
-        Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=4, num_warps=4),
-        Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_stages=5, num_warps=2),
-    ], #+ get_configs_io_bound(),
+@triton.autotune(
+    configs=[  #BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 64
+        Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, ),
+    ],
     key=['M', 'N', 'K'],
 )
-@heuristics({
-    'EVEN_K': lambda args: args['K'] % (args['BLOCK_K'] * args['SPLIT_K']) == 0,
-})
-'''
-
-
 @jit
 def _kernel(A, B, C, a_desc_ptr, b_desc_ptr, c_desc_ptr, M, N, K,  #
             acc_dtype: tl.constexpr,  #
@@ -197,6 +171,7 @@ class _matmulTma(torch.autograd.Function):
         def to_tl_type(ty):
             return getattr(tl, str(ty).split(".")[-1])
 
+        '''
         def grid(META):
             nonlocal desc_a
             nonlocal desc_b
@@ -211,7 +186,8 @@ class _matmulTma(torch.autograd.Function):
             desc_a = torch.tensor(desc_a, device=a.device)
             desc_b = torch.tensor(desc_b, device=a.device)
             desc_c = torch.tensor(desc_c, device=a.device)
-            return (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), META['SPLIT_K'])
+            return (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), 1, 1) #META['SPLIT_K'])
+        '''
 
         acc_dtype = to_tl_type(acc_dtype)
         ab_dtype = to_tl_type(ab_dtype)
@@ -226,13 +202,15 @@ class _matmulTma(torch.autograd.Function):
         if a.dtype in [tl.float8e4nv, tl.float8e5] and b.dtype in [tl.float8e4nv, tl.float8e5]:
             ab_dtype = None
         # launch kernel
-        #grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), META['SPLIT_K'])
-        _kernel[cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N), 1, 1](
+        grid = lambda META: (cdiv(M, META['BLOCK_M']) * cdiv(N, META['BLOCK_N']), 1, 1)
+        #_kernel[cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N), 1, 1](
+        _kernel[grid](
             a, b, c, desc_a, desc_b, desc_c, M, N, K,  #
             acc_dtype=acc_dtype,  #
             input_precision=input_precision,  #
             fp8_fast_accum=fp8_fast_accum,  #
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=8, SPLIT_K=1, AB_DTYPE=ab_dtype)
+            #BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            GROUP_M=8, SPLIT_K=1, AB_DTYPE=ab_dtype)
 
         # Print autotune result, i.e, best config
         #print(kernel_info.metadata)

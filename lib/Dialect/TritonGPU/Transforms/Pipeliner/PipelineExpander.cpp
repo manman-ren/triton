@@ -28,6 +28,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/MathExtras.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Debug.h"
 
@@ -119,9 +120,9 @@ bool LoopPipelinerInternal::initializeLoopInfo(
   step = forOp.getStep();
 
   dynamicLoop = true;
-  auto upperBoundCst = ub.getDefiningOp<arith::ConstantIndexOp>();
-  auto lowerBoundCst = lb.getDefiningOp<arith::ConstantIndexOp>();
-  auto stepCst = step.getDefiningOp<arith::ConstantIndexOp>();
+  auto upperBoundCst = ub.getDefiningOp<arith::ConstantIntOp>();
+  auto lowerBoundCst = lb.getDefiningOp<arith::ConstantIntOp>();
+  auto stepCst = step.getDefiningOp<arith::ConstantIntOp>();
   if (!upperBoundCst || !lowerBoundCst || !stepCst) {
     if (!options.supportDynamicLoops) {
       LDBG("--dynamic loop not supported -> BAIL");
@@ -444,8 +445,11 @@ scf::ForOp LoopPipelinerInternal::createKernelLoop(
     Type t = ub.getType();
     Location loc = forOp.getLoc();
     // newUb = ub - maxStage * step
+    bool MergeFirstPeel = ::triton::tools::getBoolEnv(
+        "MERGE_FIRST_PEEL"); // peel maxStage - 1 iterations instead of maxStage
     Value maxStageValue = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getIntegerAttr(t, maxStage));
+        loc,
+        rewriter.getIntegerAttr(t, MergeFirstPeel ? maxStage - 1 : maxStage));
     Value maxStageByStep =
         rewriter.create<arith::MulIOp>(loc, step, maxStageValue);
     newUb = rewriter.create<arith::SubIOp>(loc, ub, maxStageByStep);
@@ -477,18 +481,21 @@ LogicalResult LoopPipelinerInternal::createKernel(
     mapping.map(arg.value(), newForOp.getRegionIterArgs()[arg.index()]);
   }
   SmallVector<Value> predicates(maxStage + 1, nullptr);
-  if (!peelEpilogue) {
+  bool MergeFirstPeel = ::triton::tools::getBoolEnv("MERGE_FIRST_PEEL");
+  if (!peelEpilogue || MergeFirstPeel) {
     // Create a predicate for each stage except the last stage.
     Location loc = newForOp.getLoc();
     Type t = ub.getType();
-    for (unsigned i = 0; i < maxStage; i++) {
+    int iEnd = MergeFirstPeel ? maxStage - 1 : maxStage;
+    for (unsigned i = 0; i < iEnd; i++) {
       // c = ub - (maxStage - i) * step
+      // MergeFirstPeel: ub - (maxStage - 1 - i) * step
       Value c = rewriter.create<arith::SubIOp>(
           loc, ub,
           rewriter.create<arith::MulIOp>(
               loc, step,
               rewriter.create<arith::ConstantOp>(
-                  loc, rewriter.getIntegerAttr(t, int64_t(maxStage - i)))));
+                  loc, rewriter.getIntegerAttr(t, int64_t(iEnd - i)))));
 
       Value pred = rewriter.create<arith::CmpIOp>(
           newForOp.getLoc(), arith::CmpIPredicate::slt,
@@ -604,6 +611,7 @@ LogicalResult LoopPipelinerInternal::createKernel(
     yieldOperands.push_back(source);
   }
 
+  bool Merge_FirstEpilogue = ::triton::tools::getBoolEnv("MERGE_FIRST_PEEL");
   for (auto &it : crossStageValues) {
     int64_t version = maxStage - it.second.lastUseStage + 1;
     unsigned numVersionReturned = it.second.lastUseStage - it.second.defStage;
@@ -617,6 +625,8 @@ LogicalResult LoopPipelinerInternal::createKernel(
           newForOp.getBody()->getArguments()[yieldOperands.size() + 1 +
                                              newForOp.getNumInductionVars()]);
     }
+    if (Merge_FirstEpilogue)
+      ++version; // loop body contains the first epilogue
     setValueMapping(it.first, newForOp->getResult(yieldOperands.size()),
                     version++);
     yieldOperands.push_back(mapping.lookupOrDefault(it.first));
@@ -633,9 +643,11 @@ LogicalResult LoopPipelinerInternal::createKernel(
         setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
                         retVal.value(), stage);
     } else if (defStage->second > 0) {
-      setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
-                      newForOp->getResult(retVal.index()),
-                      maxStage - defStage->second + 1);
+      if (!Merge_FirstEpilogue || defStage->second > 1)
+        setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
+                        newForOp->getResult(retVal.index()),
+                        maxStage - defStage->second + 1 +
+                            (Merge_FirstEpilogue ? 1 : 0));
     }
   }
   rewriter.create<scf::YieldOp>(forOp.getLoc(), yieldOperands);
@@ -669,7 +681,9 @@ void LoopPipelinerInternal::emitEpilogue(
   }
   // Emit `maxStage - 1` epilogue part that includes operations from stages
   // [i; maxStage].
-  for (int64_t i = 1; i <= maxStage; i++) {
+  bool MergeFirstPeel = ::triton::tools::getBoolEnv("MERGE_FIRST_PEEL");
+  int firstPeelStage = MergeFirstPeel ? 2 : 1;
+  for (int64_t i = firstPeelStage; i <= maxStage; i++) {
     for (Operation *op : opOrder) {
       if (stages[op] < i)
         continue;

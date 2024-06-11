@@ -16,6 +16,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -180,7 +181,7 @@ public:
       LDBG("- Ops in stage " << i);
       for (auto &[op, stageAndCluster] : opToStageAndCluster) {
         if (i == stageAndCluster.first) {
-          llvm::outs() << " cluster: " << *stageAndCluster.second << " ";
+          llvm::dbgs() << " cluster: " << *stageAndCluster.second << " ";
           op->dump();
         }
       }
@@ -702,13 +703,21 @@ scheduleLoads(scf::ForOp forOp, CoarseSchedule &schedule,
 
   CoarseSchedule::Cluster rootUsersCluster = schedule.clusters.newAtFront();
   // Put the root uses of the loads in the last stage.
+  bool firstDot = true;
   for (auto &[loadOp, dist, use] : loadOpToIndLevelAndUse) {
     if (loadToInfo.count(loadOp) == 0)
       continue;
     // Non-LoadOp(s) are the root uses of all LoadOp(s) and should be
     // always present in the opInfo
     if (!isa<tt::LoadOp>(use)) {
-      schedule.insert(use, numStages - 1, rootUsersCluster);
+      if (::triton::tools::getBoolEnv("SWP_FIRST_DOT")) {
+        // check to see if it is first dot.
+        schedule.insert(use, firstDot ? numStages - 2 : numStages - 1,
+                        rootUsersCluster);
+        firstDot = false;
+      } else {
+        schedule.insert(use, numStages - 1, rootUsersCluster);
+      }
       rootUsers.insert(use);
     }
   }
@@ -1244,7 +1253,7 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
                  std::vector<std::pair<Operation *, unsigned>> &s) {
         s = std::move(schedule);
       };
-  options.peelEpilogue = false;
+  options.peelEpilogue = ::triton::tools::getBoolEnv("PEEL_EPILOGUE");
   options.predicateFn = tt::predicateOp;
   options.supportDynamicLoops = true;
   options.annotateFn = [](Operation *op,
@@ -1504,8 +1513,8 @@ static void threadValuesThroughWait(ttng::DotWaitOp wait,
 // If the op can be properly async, this function returns the index of the dot
 // in the loop's iter_args.  (Rule (2) above ensures this is well-defined.)
 //
-static std::optional<int> dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp,
-                                                scf::ForOp forOp) {
+static std::optional<int>
+dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp, scf::ForOp forOp, bool firstDot) {
   LDBG("Considering whether to make MMAv3 dot properly async: " << dotOp);
 
   // Rule 1: All shmem operands are multi-buffered.
@@ -1581,6 +1590,13 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::DotAsyncOp dotOp,
         return isa<ttng::DotAsyncOp>(use.getOwner()) &&
                use.getOperandNumber() == 2;
       })) {
+    return iterArgIdx;
+  }
+  // For the first dot that is in a different stage, it is only used by yield
+  // For the second dot, it is only used by yield, will be used by the next
+  // iteration
+  if (::triton::tools::getBoolEnv("SWP_FIRST_DOT")) {
+    // if (firstDot) return iterArgIdx;
     return iterArgIdx;
   }
 
@@ -1724,8 +1740,9 @@ void triton::asyncLaunchDots(scf::ForOp forOp) {
   // is in the loop's `yield` statement; asyncDots maps the op to its index in
   // the yield op.
   llvm::MapVector<Operation *, int /*iterArgIdx*/> properlyAsyncDots;
+  bool firstDot = true;
   for (auto dotOp : forOp.getBody()->getOps<ttng::DotAsyncOp>()) {
-    if (auto iterArgIdx = dotCanBeProperlyAsync(dotOp, forOp)) {
+    if (auto iterArgIdx = dotCanBeProperlyAsync(dotOp, forOp, firstDot)) {
       properlyAsyncDots[dotOp] = *iterArgIdx;
     } else {
       builder.setInsertionPointAfter(dotOp);
@@ -1735,6 +1752,7 @@ void triton::asyncLaunchDots(scf::ForOp forOp) {
       SmallVector<Value> waitOperands = {dotOp.getResult()};
       threadValuesThroughWait(wait, waitOperands);
     }
+    firstDot = false;
   }
 
   if (properlyAsyncDots.empty()) {

@@ -80,16 +80,21 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 # re-tuning.
 configs = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
-    for BM in [64, 128]\
-    for BN in [64, 128]\
-    for s in ([1] if is_hip() else [3, 4, 7])\
-    for w in [4, 8]\
+    #for BM in [64, 128]\
+    #for BN in [64, 128]\
+    #for s in ([1] if is_hip() else [3, 4, 7])\
+    #for w in [4, 8]\
+    for BM in [64]\
+    for BN in [128]\
+    for s in ([1] if is_hip() else [3])\
+    for w in [4]\
 ]
 
 
 def keep(conf):
     BLOCK_M = conf.kwargs["BLOCK_M"]
     BLOCK_N = conf.kwargs["BLOCK_N"]
+    # why?
     if BLOCK_M * BLOCK_N < 128 * 128 and conf.num_warps == 8:
         return False
     return True
@@ -466,6 +471,10 @@ class _attention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
             **extra_kern_args)
+        #print(kernel_info.metadata)
+        #print("num_stages=" , kernel_info.metadata.num_stages)
+        #print("num_warps=" ,kernel_info.metadata.num_warps)
+        #print(kernel_info.src.constants)
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.grid = grid
@@ -567,22 +576,20 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 64
+BATCH, N_HEADS, HEAD_DIM = 4, 8, 128  #256  #32, 64
 # vary seq length for fixed head and batch=4
 configs = []
-for mode in ["fwd", "bwd"]:
-    for causal in [True, False]:
+for mode in ["fwd"]:  #"fwd", "bwd"]:
+    for causal in [False]:  #True, False]:
         if mode == "bwd" and not causal:
             continue
         configs.append(
             triton.testing.Benchmark(
                 x_names=["N_CTX"],
-                x_vals=[2**i for i in range(10, 15)],
+                x_vals=[16384],  #8192],  #2**i for i in range(10, 14)],
                 line_arg="provider",
-                line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
-                (["flash"] if HAS_FLASH else []),
-                line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
-                (["Flash-2"] if HAS_FLASH else []),
+                line_vals=(["triton-fp8"] if TORCH_HAS_FP8 else []) + (["flash"] if HAS_FLASH else []),
+                line_names=(["Triton [FP8]"] if TORCH_HAS_FP8 else []) + (["Flash-2"] if HAS_FLASH else []),
                 styles=[("red", "-"), ("blue", "-")],
                 ylabel="ms",
                 plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}",

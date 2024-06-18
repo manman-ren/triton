@@ -362,7 +362,6 @@ class CudaLauncher(object):
         self.launch = mod.launch
 
     def __call__(self, *args, **kwargs):
-        #import pdb; pdb.set_trace()
         self.launch(*args, **kwargs)
 
 

@@ -164,7 +164,6 @@ class _matmul(torch.autograd.Function):
         assert a.shape[1] == b.shape[0], "incompatible dimensions"
         M, K = a.shape
         _, N = b.shape
-        print("M N K", M, N, K, b.stride(0), b.stride(1))
 
         # common type between a and b
         ab_dtype = get_higher_dtype(a.dtype, b.dtype)

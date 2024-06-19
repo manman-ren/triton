@@ -95,6 +95,7 @@ class Autotuner(KernelInterface):
 
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
+        print("test config", config)
 
         # check for conflicts, i.e. meta-parameters both provided
         # as kwargs and by the autotuner

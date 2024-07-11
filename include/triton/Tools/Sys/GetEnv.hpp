@@ -31,6 +31,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "SWP_FIRST_DOT",
     "MERGE_FIRST_PEEL",
     "PEEL_EPILOGUE",
+    "LOAD_DIFFERENT_STAGE",
     // clang-format on
 };
 

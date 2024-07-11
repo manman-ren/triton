@@ -712,6 +712,9 @@ scheduleLoads(scf::ForOp forOp, CoarseSchedule &schedule,
   }
   unsigned stagesBetweenLoads =
       ceil<unsigned>(numStages - 2, maxIndirectionLevel + 1);
+  LDBG("maxIndirectionLevel = " << maxIndirectionLevel
+                                << " stagesBetweenLoads = "
+                                << stagesBetweenLoads);
 
   CoarseSchedule::Cluster rootUsersCluster = schedule.clusters.newAtFront();
   // Put the root uses of the loads in the last stage.
@@ -739,18 +742,39 @@ scheduleLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     loadsClusters.push_back(schedule.clusters.newAtBack());
   }
   // Assign stages to the loads.
+  unsigned iter = 0;
+  DenseSet<Operation *> addedLoads;
   for (auto [loadOp, indLevel, _] : loadOpToIndLevelAndUse) {
     if (loadToInfo.count(loadOp) == 0)
       continue;
     int stage = (maxIndirectionLevel - indLevel) * stagesBetweenLoads;
+    // Hard-code for the case of maxIndirectionLevel is 0.
+    if (::triton::tools::getBoolEnv("LOAD_DIFFERENT_STAGE")) {
+      if (addedLoads.count(loadOp))
+        continue;
+      stage = iter;
+      ++iter;
+    }
+    addedLoads.insert(loadOp);
     schedule.insert(loadOp, stage, loadsClusters[indLevel]);
+    LDBG("load in stage " << stage);
   }
 
   // Distance from the load to the use.
+  DenseSet<Operation *> seenLoads;
   for (auto [loadOp, _, use] : loadOpToIndLevelAndUse) {
     if (loadToInfo.count(loadOp) == 0)
       continue;
+    // For the case where loadOp has multiple uses with indLevel of 0, should we
+    // ignore one of the uses? As an example, load -> dot1 -> dot2, can we
+    // ignore the use of load -> dot2?
+    if (::triton::tools::getBoolEnv("LOAD_DIFFERENT_STAGE")) {
+      if (seenLoads.count(loadOp))
+        continue;
+    }
+    seenLoads.insert(loadOp);
     loadToInfo[loadOp].distToUse = schedule[use].first - schedule[loadOp].first;
+    LDBG("load distToUse " << loadToInfo[loadOp].distToUse);
   }
 
   return loadToInfo;
@@ -1099,7 +1123,7 @@ createAsyncOps(scf::ForOp &forOp, CoarseSchedule &schedule,
     // pipelining post-processing.
     numBuffers++;
   };
-  LDBG("numBuffers" << numBuffers);
+  LDBG("numBuffers = " << numBuffers);
 
   SmallVector<AsyncLoad> asyncLoads;
   SmallVector<Value> allocs;

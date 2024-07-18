@@ -833,7 +833,7 @@ scheduleLoads(scf::ForOp forOp, CoarseSchedule &schedule,
     // For the case where loadOp has multiple uses with indLevel of 0, should we
     // ignore one of the uses? As an example, load -> dot1 -> dot2, can we
     // ignore the use of load -> dot2?
-    if (::triton::tools::getBoolEnv("LOAD_DIFFERENT_STAGE")) {
+    if (::triton::tools::getBoolEnv("FIRST_LOAD_OF_USE")) {
       if (seenLoads.count(loadOp))
         continue;
     }
@@ -1322,7 +1322,7 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
   });
   {
     ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
-    moduleOp.dump();
+    // moduleOp.dump();
   }
 
   SmallVector<Value> barriers;
@@ -1337,7 +1337,7 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
   });
   {
     ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
-    moduleOp.dump();
+    // moduleOp.dump();
   }
 
   CoarseSchedule::Cluster afterPrologue =

@@ -78,11 +78,16 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 # We don't run auto-tuning every time to keep the tutorial fast. Uncommenting
 # the code below and commenting out the equivalent parameters is convenient for
 # re-tuning.
+# BLOCK_M: 128, BLOCK_N: 128, num_warps: 8, num_ctas: 1, num_stages: 3
+# BLOCK_M: 64, BLOCK_N: 64, num_warps: 4, num_ctas: 1, num_stages: 3
+# [3,4,7] [64,128]
+# BLOCK_M: 128, BLOCK_N: 128, num_warps: 8, num_ctas: 1, num_stages: 4 (best with computation pipelining)
+# BLOCK_M: 128, BLOCK_N: 128, num_warps: 8, num_ctas: 1, num_stages: 3 (base)
 configs = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
     for BM in [64, 128]\
     for BN in [64, 128]\
-    for s in ([1] if is_hip() else [3, 4, 7])\
+    for s in ([1] if is_hip() else [3, 4])\
     for w in [4, 8]\
 ]
 
@@ -567,21 +572,21 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 64
+BATCH, N_HEADS, HEAD_DIM = 8, 8, 128
+#8, 16, 128
 # vary seq length for fixed head and batch=4
 configs = []
-for mode in ["fwd", "bwd"]:
-    for causal in [True, False]:
+for mode in ["fwd"]:  #["fwd", "bwd"]:
+    for causal in [False]:  #[True, False]:
         if mode == "bwd" and not causal:
             continue
         configs.append(
             triton.testing.Benchmark(
                 x_names=["N_CTX"],
-                x_vals=[2**i for i in range(10, 15)],
+                x_vals=[2**i for i in range(9, 15)],
                 line_arg="provider",
-                line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
-                (["flash"] if HAS_FLASH else []),
-                line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
+                line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
+                line_names=["Triton [FP16]"] +  #(["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
                 (["Flash-2"] if HAS_FLASH else []),
                 styles=[("red", "-"), ("blue", "-")],
                 ylabel="ms",

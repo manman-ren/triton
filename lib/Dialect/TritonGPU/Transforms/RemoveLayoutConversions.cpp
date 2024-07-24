@@ -163,6 +163,14 @@ void LayoutRematerialization::cleanup() {
     op->erase();
 }
 
+static bool getBoolEnv(const std::string &env) {
+  const char *s = std::getenv(env.c_str());
+  std::string str(s ? s : "");
+  std::transform(str.begin(), str.end(), str.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return str == "on" || str == "true" || str == "1";
+}
+
 // Look ahead to at the transitive uses and see if there is a convert to mma
 // operations.
 bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
@@ -214,8 +222,24 @@ bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
       bool isMMAV3 =
           isa<NvidiaMmaEncodingAttr>(encoding) &&
           cast<NvidiaMmaEncodingAttr>(encoding).getVersionMajor() == 3;
-      if (isMMAV3 && (isa<LocalAllocOp>(op) || isa<LocalStoreOp>(op)))
-        return true;
+      // When we have a tma store, it has a localStore causing an illegal
+      // convert_layout from mma to dot of another mma. We can also try to
+      // bypass when op is inside if.
+      if (getBoolEnv("BYPASS_MMA_PROP1")) {
+        if (isMMAV3 && (isa<LocalAllocOp>(op)))
+          return true;
+      } else if (getBoolEnv("BYPASS_MMA_PROP2")) {
+        if (isMMAV3 && (isa<LocalAllocOp>(op) || isa<LocalStoreOp>(op))) {
+          auto parentOp = op->getParentOp();
+          if (parentOp && isa<scf::IfOp>(parentOp)) {
+          } else {
+            return true;
+          }
+        }
+      } else {
+        if (isMMAV3 && (isa<LocalAllocOp>(op) || isa<LocalStoreOp>(op)))
+          return true;
+      }
       auto yield = dyn_cast<scf::YieldOp>(op);
       if (!yield)
         continue;

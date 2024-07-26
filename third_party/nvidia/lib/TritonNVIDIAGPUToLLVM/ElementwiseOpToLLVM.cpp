@@ -355,7 +355,7 @@ struct FpToFpOpConversion
     cvt(res, operand);
     // TODO: This is a hack to get the right type. We should be able to invoke
     // the type converter
-    return builder.launch(rewriter, loc, i16_ty, false);
+    return builder.launch(rewriter, loc, bf16_ty, false);
   }
 
   static Value convertFp32ToFp16(Location loc,
@@ -574,7 +574,7 @@ struct FMulOpConversion
       auto lhs = builder.newOperand(operands[0][0], "h");
       auto rhs = builder.newOperand(operands[0][1], "h");
       fMul({res, lhs, rhs}, /*onlyAttachMLIRArgs=*/true);
-      return {builder.launch(rewriter, loc, i16_ty, false)};
+      return {builder.launch(rewriter, loc, bf16_ty, false)};
     } else {
       return {rewriter.create<LLVM::FMulOp>(loc, elemTy, operands[0][0],
                                             operands[0][1])};
@@ -604,7 +604,7 @@ struct FAddOpConversion
       auto lhs = builder.newOperand(operands[0][0], "h");
       auto rhs = builder.newOperand(operands[0][1], "h");
       fAdd({res, lhs, rhs}, /*onlyAttachMLIRArgs=*/true);
-      return {builder.launch(rewriter, loc, i16_ty, false)};
+      return {builder.launch(rewriter, loc, bf16_ty, false)};
     } else {
       return {rewriter.create<LLVM::FAddOp>(loc, elemTy, operands[0][0],
                                             operands[0][1])};
@@ -634,7 +634,7 @@ struct FSubOpConversion
       auto lhs = builder.newOperand(operands[0][0], "h");
       auto rhs = builder.newOperand(operands[0][1], "h");
       fSub({res, lhs, rhs}, /*onlyAttachMLIRArgs=*/true);
-      return {builder.launch(rewriter, loc, i16_ty, false)};
+      return {builder.launch(rewriter, loc, bf16_ty, false)};
     } else {
       return {rewriter.create<LLVM::FSubOp>(loc, elemTy, operands[0][0],
                                             operands[0][1])};
@@ -664,10 +664,6 @@ struct SIToFPOpConversion
       auto outVals = cvtFunc(loc, rewriter, inVals);
       assert(outVals.size() == 4);
       return outVals;
-    } else if (outElemTy.isBF16()) {
-      auto value = rewriter.create<LLVM::SIToFPOp>(loc, f32_ty, operands[0][0]);
-      return {FpToFpOpConversion::convertFp32ToBf16(loc, rewriter, value,
-                                                    RoundingMode::RTNE)};
     } else {
       return {rewriter.create<LLVM::SIToFPOp>(loc, elemTy, operands[0][0])};
     }
@@ -685,13 +681,7 @@ struct FPToSIOpConversion
                                    Type elemTy, MultipleOperandsRange operands,
                                    Location loc) const {
     auto inElemTy = getElementType(op.getIn());
-    if (inElemTy.isBF16()) {
-      auto value =
-          FpToFpOpConversion::convertBf16ToFp32(loc, rewriter, operands[0][0]);
-      return {rewriter.create<LLVM::FPToSIOp>(loc, elemTy, value)};
-    } else {
-      return {rewriter.create<LLVM::FPToSIOp>(loc, elemTy, operands[0][0])};
-    }
+    return {rewriter.create<LLVM::FPToSIOp>(loc, elemTy, operands[0][0])};
   }
 };
 

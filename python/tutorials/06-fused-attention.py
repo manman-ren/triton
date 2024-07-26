@@ -75,13 +75,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     return acc, l_i, m_i
 
 
-# We don't run auto-tuning every time to keep the tutorial fast. Uncommenting
+# We don't run auto-tuning every time to keep the tutorial fast. Keeping
 # the code below and commenting out the equivalent parameters is convenient for
 # re-tuning.
 configs = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
     for BM in [64, 128]\
-    for BN in [64, 128]\
+    for BN in [32, 64]\
     for s in ([1] if is_hip() else [3, 4, 7])\
     for w in [4, 8]\
 ]
@@ -95,7 +95,7 @@ def keep(conf):
     return True
 
 
-@triton.autotune(list(filter(keep, configs)), key=["N_CTX"])
+@triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
               stride_qz, stride_qh, stride_qm, stride_qk,  #
@@ -103,9 +103,9 @@ def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
               stride_vz, stride_vh, stride_vk, stride_vn,  #
               stride_oz, stride_oh, stride_om, stride_on,  #
               Z, H, N_CTX,  #
+              HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
-              HEAD_DIM: tl.constexpr,  #
               STAGE: tl.constexpr  #
               ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
@@ -442,7 +442,7 @@ class _attention(torch.autograd.Function):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
-        HEAD_DIM_V = v.shape[-2] if v.dtype == torch.float8_e5m2 else v.shape[-1]
+        HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         o = torch.empty_like(q)
@@ -551,7 +551,7 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16):
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
     rtol = 0.0
     # Relative tolerance workaround for known hardware limitation of MI200 GPU.
-    # For detailss see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
+    # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
     if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
         rtol = 1e-2
     assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=rtol)
@@ -583,7 +583,7 @@ for mode in ["fwd", "bwd"]:
                 (["flash"] if HAS_FLASH else []),
                 line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []) +
                 (["Flash-2"] if HAS_FLASH else []),
-                styles=[("red", "-"), ("blue", "-")],
+                styles=[("red", "-"), ("blue", "-"), ("green", "-")],
                 ylabel="ms",
                 plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}",
                 args={
@@ -603,12 +603,13 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
     rep = 100
     dtype = torch.float16
     if "triton" in provider:
-        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda", requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda", requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda", requires_grad=True)
+        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         if mode == "fwd" and "fp8" in provider:
             q = q.to(torch.float8_e5m2)
             k = k.to(torch.float8_e5m2)
+            v = v.permute(0, 1, 3, 2).contiguous()
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3

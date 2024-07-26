@@ -73,8 +73,32 @@ class DependenciesFinder(ast.NodeVisitor):
     def ret(self):
         return self.hasher.hexdigest()
 
+    def _is_triton_builtin(self, node, func):
+        if inspect.isbuiltin(node.func):
+            return True
+        module = getattr(func, "__module__", "")
+        return module.startswith(TRITON_MODULE)
+
+    def _update_hash(self, func):
+        if isinstance(func, JITFunction):
+            # Merge our used_global_vals with those of the called function,
+            # after checking that all overlapping values are consistent.
+            for k in self.used_global_vals.keys() & func.used_global_vals.keys():
+                var_name, _ = k
+                v1, _ = self.used_global_vals[k]
+                v2, _ = func.used_global_vals[k]
+                if v1 != v2:
+                    raise RuntimeError(
+                        f"Global variable {var_name} has value {v1} when compiling {self.name}, but inner kernel {func.__name__} has conflicting value {v2} from when it was first compiled.  This is not allowed."
+                    )
+            self.used_global_vals.update(func.used_global_vals)
+            # update hash
+            func_key = func.cache_key
+            func_key += str(getattr(func, "noinline", False))
+            self.hasher.update(func_key.encode("utf-8"))
+
     def visit_Name(self, node):
-        if type(node.ctx) == ast.Store:
+        if type(node.ctx) is ast.Store:
             return node.id
 
         if node.id in self.local_names:
@@ -93,14 +117,14 @@ class DependenciesFinder(ast.NodeVisitor):
                 and not self.visiting_arg_default_value
                 # It would be pretty evil if someone did `import x` and then
                 # `x = blah`.
-                and type(val) != ModuleType
+                and type(val) is not ModuleType
                 # It would be pretty evil if we used function `foo` inside of
                 # `bar` and then someone did `foo = baz`.
                 and not isinstance(val, JITFunction) and not getattr(val, "__triton_builtin__", False)  #
-                and node.id not in self.supported_python_builtins  #
-            ):
+                and node.id not in self.supported_python_builtins):
             self.used_global_vals[(node.id, id(self.globals))] = (val, self.globals)
 
+        self._update_hash(val)
         return val
 
     def visit_Tuple(self, node):
@@ -114,52 +138,9 @@ class DependenciesFinder(ast.NodeVisitor):
             lhs = self.visit(lhs.value)
         if lhs is None or (getattr(lhs, "__name__", "") == TRITON_MODULE):
             return None
-        return getattr(lhs, node.attr)
-
-    def visit_Call(self, node):
-
-        def is_triton_builtin(func):
-            if inspect.isbuiltin(node.func):
-                return True
-            module = getattr(func, "__module__", "")
-            return module.startswith(TRITON_MODULE)
-
-        func = self.visit(node.func)
-        assert func is None or is_triton_builtin(func) or isinstance(
-            func, JITFunction
-        ), f'Function "{func.__name__}" is being called from a Triton function but is not a Triton function itself. Decorate it with @triton.jit to fix this'
-
-        # Traverse arguments as well as node.func so we can find JITFunctions
-        # passed to tl.reduce or tl.associative_scan as the combine_fn
-        for obj in itertools.chain(
-            (func, ),
-                map(self.visit, node.args),
-            (self.visit(kw.value) for kw in node.keywords),
-        ):
-            if not isinstance(obj, JITFunction):
-                continue
-            if is_triton_builtin(obj):
-                continue
-
-            func_cache_key = obj.cache_key
-
-            # Merge our used_global_vals with those of the called function,
-            # after checking that all overlapping values are consistent.
-            for k in self.used_global_vals.keys() & obj.used_global_vals.keys():
-                var_name, _ = k
-                v1, _ = self.used_global_vals[k]
-                v2, _ = obj.used_global_vals[k]
-                if v1 != v2:
-                    raise RuntimeError(
-                        f"Global variable {var_name} has value {v1} when compiling {self.name}, but inner kernel {func.__name__} has conflicting value {v2} from when it was first compiled.  This is not allowed."
-                    )
-
-            self.used_global_vals.update(obj.used_global_vals)
-
-            noinline = str(getattr(obj, "noinline", False))
-
-            key = func_cache_key + noinline
-            self.hasher.update(key.encode("utf-8"))
+        ret = getattr(lhs, node.attr)
+        self._update_hash(ret)
+        return ret
 
     def visit_FunctionDef(self, node):
         # Save the local name, which may hide the global name.
@@ -668,7 +649,7 @@ class JITFunction(KernelInterface[T]):
 
         # Check that used global values have not changed.
         not_present = object()
-        for (name, globals_dict_id), (val, globals_dict) in self.used_global_vals.items():
+        for (name, _), (val, globals_dict) in self.used_global_vals.items():
             if (newVal := globals_dict.get(name, not_present)) != val:
                 raise RuntimeError(
                     f"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}")
@@ -866,7 +847,8 @@ def jit(
         assert callable(fn)
         if os.getenv("TRITON_INTERPRET", "0") == "1":
             from .interpreter import InterpretedFunction
-            return InterpretedFunction(fn)
+            return InterpretedFunction(fn, version=version, do_not_specialize=do_not_specialize, debug=debug,
+                                       noinline=noinline, repr=repr, launch_metadata=launch_metadata)
         else:
             return JITFunction(
                 fn,
@@ -954,3 +936,21 @@ def reinterpret(tensor, dtype):
         return TensorWrapper(tensor, dtype)
     else:
         raise TypeError(f"Cannot reinterpret a {type(tensor)}.")
+
+
+def get_jit_fn_file_line(fn):
+    base_fn = fn
+    while not isinstance(base_fn, JITFunction):
+        base_fn = base_fn.fn
+    file_name = base_fn.fn.__code__.co_filename
+    lines, begin_line = inspect.getsourcelines(base_fn.fn)
+    # Match the following pattern:
+    # @triton.autotune(...) <- foo.__code__.co_firstlineno
+    # @triton.heuristics(...)
+    # @triton.jit
+    # def foo(...): <- this line is the first line
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("def "):
+            begin_line += idx
+            break
+    return file_name, begin_line

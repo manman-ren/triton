@@ -114,8 +114,8 @@ struct LoadStoreConversionBase {
   }
 
 protected:
-  ModuleAxisInfoAnalysis &axisAnalysisPass;
   const AMD::TargetInfo &targetInfo;
+  ModuleAxisInfoAnalysis &axisAnalysisPass;
 };
 
 struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
@@ -224,7 +224,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
         falseVal = v;
       }
 
-      auto loadVal = llLoad(rewriter, loc, ptr, vecTy, pred, falseVal);
+      bool nt = op.getCache() == triton::CacheModifier::CG;
+      auto loadVal = llLoad(rewriter, loc, ptr, vecTy, pred, falseVal, nt);
       for (size_t ii = 0; ii < vec; ++ii) {
         Value vecIdx = createIndexAttrConstant(
             rewriter, loc, this->getTypeConverter()->getIndexType(), ii % vec);

@@ -21,12 +21,17 @@ class SharedEncodingAttr;
 }
 } // namespace triton
 
+// Return a tuple of two or three entries representing the shape of the
+// instruction used to perform a matrix multiplication operation.
+// Version = 1: <m, n>
+// Version = 2: <1, m, n>
+// Version = 3: <m, n, k>
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
-                                                TensorOrMemDesc type,
+                                                RankedTensorType type,
                                                 int numWarps);
 
-/// Returns true if the Load uses block pointer.
+// Return true if the Load uses block pointer.
 bool isLoadFromTensorPtr(triton::LoadOp op);
 
 // Return an array of indices enumerating the elements of 'arr' in descending
@@ -168,6 +173,9 @@ Value linearize(OpBuilder &b, Location loc, ArrayRef<Value> multiDim,
 // Return true if the op is a pure elementwise_inline_asm op with a single
 // operand and single result.
 bool isPureUnaryInlineAsm(Operation *op);
+
+// read the compute capability from the module attributes
+int getNVIDIAComputeCapability(Operation *module);
 
 } // namespace mlir
 

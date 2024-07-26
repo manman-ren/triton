@@ -60,26 +60,21 @@ getCvtOrder(Attribute srcLayout, Attribute dstLayout) {
 SmallVector<unsigned> getRepShapeForCvtLayout(triton::gpu::ConvertLayoutOp op) {
   auto srcTy = op.getSrc().getType();
   auto dstTy = op.getType();
+  return getRepShapeForCvtLayout(srcTy, dstTy);
+}
+
+SmallVector<unsigned> getRepShapeForCvtLayout(RankedTensorType srcTy,
+                                              RankedTensorType dstTy) {
   Attribute srcLayout = srcTy.getEncoding();
   Attribute dstLayout = dstTy.getEncoding();
+
+  if (!cvtNeedsSharedMemory(srcTy, dstTy)) {
+    return {};
+  }
 
   if (shouldUseDistSmem(srcLayout, dstLayout)) {
     // TODO: padding to avoid bank conflicts
     return convertType<unsigned, int64_t>(getShapePerCTA(srcTy));
-  }
-
-  // MmaToDotShortcut and MmaToMmaShortcut doesn't use shared mem
-  if (auto srcMmaLayout = mlir::dyn_cast<NvidiaMmaEncodingAttr>(srcLayout)) {
-    if (mlir::isa<DotOperandEncodingAttr>(dstLayout)) {
-      if (isMmaToDotShortcut(srcTy, dstTy)) {
-        return {};
-      }
-    } else if (auto dstMmaLayout =
-                   mlir::dyn_cast<NvidiaMmaEncodingAttr>(dstLayout)) {
-      if (isMmaToMmaShortcut(srcTy, dstTy)) {
-        return {};
-      }
-    }
   }
 
   assert(srcLayout && dstLayout && "Unexpected layout in getRepShape()");
@@ -102,20 +97,23 @@ SmallVector<unsigned> getRepShapeForCvtLayout(triton::gpu::ConvertLayoutOp op) {
 SmallVector<unsigned>
 getScratchConfigForCvtLayout(triton::gpu::ConvertLayoutOp op, unsigned &inVec,
                              unsigned &outVec) {
-  auto repShape = getRepShapeForCvtLayout(op);
+  auto srcTy = op.getSrc().getType();
+  auto dstTy = op.getType();
+  return getScratchConfigForCvtLayout(srcTy, dstTy, inVec, outVec);
+}
+
+SmallVector<unsigned> getScratchConfigForCvtLayout(RankedTensorType srcTy,
+                                                   RankedTensorType dstTy,
+                                                   unsigned &inVec,
+                                                   unsigned &outVec) {
+  auto repShape = getRepShapeForCvtLayout(srcTy, dstTy);
   if (repShape.empty())
     return repShape;
   auto rank = repShape.size();
-  auto srcTy = op.getSrc().getType();
-  auto dstTy = op.getType();
   Attribute srcLayout = srcTy.getEncoding();
   Attribute dstLayout = dstTy.getEncoding();
 
-  if (mlir::isa<AMDMfmaEncodingAttr>(srcLayout) &&
-      mlir::dyn_cast<AMDMfmaEncodingAttr>(srcLayout).getIsTransposed() &&
-      mlir::isa<DotOperandEncodingAttr>(dstLayout))
-    if (isMfmaToDotShortcut(srcTy, dstTy))
-      return {};
+  assert(!isMfmaToDotShortcut(srcTy, dstTy));
 
   auto [inOrd, outOrd] = getCvtOrder(srcLayout, dstLayout);
   unsigned srcContigPerThread =
@@ -211,7 +209,8 @@ private:
     // XXX(Keren): Why this hard-coded alignment?
     size_t kAlignment = 8;
     for (Value result : op->getResults()) {
-      if (auto alloc = result.getDefiningOp<triton::gpu::LocalAllocOp>()) {
+      auto alloc = result.getDefiningOp<triton::gpu::LocalAllocOp>();
+      if (alloc && alloc.isSharedMemoryAlloc()) {
         // Bytes could be a different value once we support padding or other
         // allocation policies.
         auto allocType = alloc.getType();
@@ -283,8 +282,7 @@ private:
       unsigned inVec = 0;
       unsigned outVec = 0;
       auto smemShape = getScratchConfigForCvtLayout(cvtLayout, inVec, outVec);
-      unsigned elems = std::accumulate(smemShape.begin(), smemShape.end(), 1,
-                                       std::multiplies{});
+      auto elems = getNumElements<unsigned>(smemShape);
       auto bytes =
           isa<triton::PointerType>(srcTy.getElementType())
               ? elems * kPtrBitWidth / 8
@@ -299,8 +297,7 @@ private:
         // nothing to do
       } else {
         auto smemShape = getScratchConfigForAtomicRMW(atomicRMWOp);
-        unsigned elems = std::accumulate(smemShape.begin(), smemShape.end(), 1,
-                                         std::multiplies{});
+        auto elems = getNumElements<unsigned>(smemShape);
         auto elemTy =
             cast<triton::PointerType>(value.getType()).getPointeeType();
         auto bytes =
@@ -318,8 +315,7 @@ private:
         // nothing to do
       } else {
         auto smemShape = getScratchConfigForAtomicCAS(atomicCASOp);
-        unsigned elems = std::accumulate(smemShape.begin(), smemShape.end(), 1,
-                                         std::multiplies{});
+        auto elems = getNumElements<unsigned>(smemShape);
         auto elemTy =
             cast<triton::PointerType>(value.getType()).getPointeeType();
         auto bytes = isa<triton::PointerType>(elemTy)
@@ -641,6 +637,29 @@ private:
 
 void Allocation::run(FuncAllocMapT &funcAllocMap) {
   triton::AllocationAnalysis(getOperation(), &funcAllocMap, this);
+}
+
+std::map<Operation *, SmallVector<Allocation::BufferId>>
+Allocation::getLiveBuffers() {
+  std::map<Operation *, SmallVector<BufferId>> liveBuffers;
+
+  Operation *rootOperation = getOperation();
+  mlir::Liveness liveness(rootOperation);
+  auto analyzeOperation = [&](Operation *op) -> void {
+    auto scratchBuffer = getBufferId(op);
+    if (scratchBuffer != InvalidBufferId)
+      liveBuffers[op].push_back(scratchBuffer);
+    for (auto result : op->getOpResults()) {
+      auto bufferId = getBufferId(result);
+      if (bufferId == Allocation::InvalidBufferId)
+        continue;
+      auto liveOperations = liveness.resolveLiveness(result);
+      for (auto depOp : liveOperations)
+        liveBuffers[depOp].push_back(bufferId);
+    }
+  };
+  rootOperation->walk(analyzeOperation);
+  return liveBuffers;
 }
 
 } // namespace mlir

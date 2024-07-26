@@ -176,8 +176,8 @@ private:
   void warpReduce(ConversionPatternRewriter &rewriter, Location loc,
                   SmallVector<Value> &acc, triton::ReduceOp op,
                   unsigned numLaneToReduce, unsigned interleave) const {
-    auto success =
-        targetInfo.warpReduce(rewriter, loc, acc, op, numLaneToReduce);
+    auto success = targetInfo.warpReduce(rewriter, loc, acc, op,
+                                         numLaneToReduce, interleave);
     if (success)
       return;
     for (unsigned N = numLaneToReduce / 2; N > 0; N >>= 1) {
@@ -341,8 +341,8 @@ private:
         auto elemTy = getElementType(op, i);
         Value readPtr = gep(ptr_ty(rewriter.getContext(), 3), elemTy,
                             smemBases[i], readOffset);
-        acc[i] = targetInfo.loadShared(rewriter, loc, getTypeConverter(),
-                                       readPtr, elemTy, threadIsNeeded);
+        acc[i] = targetInfo.loadShared(rewriter, loc, readPtr, elemTy,
+                                       threadIsNeeded);
       }
       warpReduce(rewriter, loc, acc, op, sizeInterWarps, 1 /* interleave */);
       // only the first thread in each sizeInterWarps is writing

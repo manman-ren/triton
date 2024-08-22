@@ -30,6 +30,9 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "TRITON_LLVM_DEBUG_ONLY",
     "USE_IR_LOC",
     "NVPTX_ENABLE_DUMP",
+    "SWP_FIRST_DOT",
+    "PEEL_EPILOGUE",
+    "LOAD_DIFFERENT_STAGE",
     // clang-format on
 };
 

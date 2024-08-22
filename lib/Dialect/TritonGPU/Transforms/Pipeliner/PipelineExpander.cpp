@@ -27,6 +27,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/RegionUtils.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
@@ -119,9 +120,9 @@ bool LoopPipelinerInternal::initializeLoopInfo(
   step = forOp.getStep();
 
   dynamicLoop = true;
-  auto upperBoundCst = ub.getDefiningOp<arith::ConstantIndexOp>();
-  auto lowerBoundCst = lb.getDefiningOp<arith::ConstantIndexOp>();
-  auto stepCst = step.getDefiningOp<arith::ConstantIndexOp>();
+  auto upperBoundCst = ub.getDefiningOp<arith::ConstantIntOp>();
+  auto lowerBoundCst = lb.getDefiningOp<arith::ConstantIntOp>();
+  auto stepCst = step.getDefiningOp<arith::ConstantIntOp>();
   if (!upperBoundCst || !lowerBoundCst || !stepCst) {
     if (!options.supportDynamicLoops) {
       LDBG("--dynamic loop not supported -> BAIL");

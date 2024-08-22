@@ -687,7 +687,8 @@ static tt::CoarseSchedule::Cluster
 schedulePrologueAndEpilogue(scf::ForOp forOp, tt::CoarseSchedule &schedule,
                             DenseSet<Operation *> &rootUsers, int numStages) {
   tt::CoarseSchedule::Cluster afterPrologue = schedule.clusters.begin();
-  return afterPrologue;
+  if (::triton::tools::getBoolEnv("BYPASS_IF_HANDLING"))
+    return afterPrologue;
 
   // Look for the IfOp that is in the backward slice any of the currently
   // scheduled ops and put it at the beginning of the loop.

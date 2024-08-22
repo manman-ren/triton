@@ -35,6 +35,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "LOAD_DIFFERENT_STAGE",
     "INCLUDE_MULF",
     "FIRST_LOAD_OF_USE",
+    "BYPASS_IF_HANDLING",
     // clang-format on
 };
 

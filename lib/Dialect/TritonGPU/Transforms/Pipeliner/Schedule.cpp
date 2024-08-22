@@ -24,7 +24,18 @@ void tt::CoarseSchedule::insertDepsOfOp(
     if (insertIfAbsent(wait, stage, cluster))
       insertDepsOfOp(wait, stage, cluster, includeArg, additionalDep);
   }
-  for (Value operand : op->getOperands()) {
+  auto getNestedOperands = [](Operation *op) -> SmallVector<Value> {
+    SmallVector<Value> operands;
+    op->walk([&](Operation *nestedOp) {
+      for (Value operand : nestedOp->getOperands()) {
+        if (operand.getParentBlock()->getParentOp()->isAncestor(nestedOp))
+          operands.push_back(operand);
+      }
+    });
+    return operands;
+  };
+
+  for (Value operand : getNestedOperands(op)) {
     Value v = operand;
     llvm::SmallDenseSet<Value> seen;
     while (auto arg = dyn_cast<BlockArgument>(v)) {

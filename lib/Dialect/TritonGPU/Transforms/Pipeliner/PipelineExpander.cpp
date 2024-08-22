@@ -240,6 +240,10 @@ bool LoopPipelinerInternal::verifySchedule() {
     assert(it != stages.end());
     int64_t stage = it->second;
     unrolledCyles[def] = cycle + stage * numCylesPerIter;
+    LLVM_DEBUG({
+      LDBG("opOrder at cycle " << cycle << " stage " << stage);
+      def->dump();
+    });
   }
   for (Operation *consumer : opOrder) {
     int64_t consumerCycle = unrolledCyles[consumer];
@@ -254,6 +258,12 @@ bool LoopPipelinerInternal::verifySchedule() {
       int64_t producerCycle = it->second;
       if (consumerCycle < producerCycle - numCylesPerIter * distance) {
         consumer->emitError("operation scheduled before its operands");
+        LLVM_DEBUG({
+          LDBG("consumerCycle " << consumerCycle << " " << producerCycle << " "
+                                << numCylesPerIter << " " << distance);
+          producer->dump();
+          operand.dump();
+        });
         return false;
       }
     }

@@ -332,6 +332,18 @@ getSharedEncoding(Operation *loadOp, bool isMMAV3) {
                                       ctaLayout);
 }
 
+static bool isHeavyMulf(Operation *op) {
+  if (!isa<arith::MulFOp>(op))
+    return false;
+  auto tensorTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+  if (!tensorTy)
+    return false;
+  // only 2D tensor.
+  if (tensorTy.getRank() < 2)
+    return false;
+  return true;
+}
+
 // Create a map from load ops to their indirection level and the
 // final use of the load op (another load op, or a dot op).
 // Indirection level is "0" for the load op directly used by the dot op,
@@ -362,8 +374,14 @@ loadOpsToIndirectionLevelAndUse(scf::ForOp forOp) {
       };
 
   for (Operation &op : forOp.getBody()->without_terminator()) {
-    if (!op.hasTrait<OpTrait::DotLike>())
-      continue;
+    // When INCLUDE_MULF is true, handle both Dot and heavy mulf.
+    if (::triton::tools::getBoolEnv("INCLUDE_MULF")) {
+      if (!op.hasTrait<OpTrait::DotLike>() && !isHeavyMulf(&op))
+        continue;
+    } else {
+      if (!op.hasTrait<OpTrait::DotLike>())
+        continue;
+    }
     seen.clear();
     dfs(&op, 0, &op);
   }
@@ -562,20 +580,58 @@ scheduleLoads(scf::ForOp forOp, tt::CoarseSchedule &schedule,
 
   tt::CoarseSchedule::Cluster rootUsersCluster = schedule.clusters.newAtFront();
   // Put the root uses of the loads in the last stage.
-  bool firstDot = true;
+  // When INCLUDE_MULF is true, use fixed schedule:
+  //   We can't put two dots in different stages as they use the same loaded
+  //   value second mul is in numStages - 1, rest in numStages - 2 first dot in
+  //   rootUsersCluster, seond mul in nextCluster, second dot and mul0 are in
+  //   nextNextCluster Need to make sure mul0 is after second dot in program
+  //   order
+  bool firstDot = true, firstMulF = true;
+  tt::CoarseSchedule::Cluster nextCluster = rootUsersCluster;
+  tt::CoarseSchedule::Cluster nextNextCluster = rootUsersCluster;
+  if (::triton::tools::getBoolEnv("INCLUDE_MULF")) {
+    nextCluster = schedule.clusters.newAtBack();
+    nextNextCluster = schedule.clusters.newAtBack();
+  }
   for (auto &[loadOp, dist, use] : loadOpToIndLevelAndUse) {
+    // We should traverse dot/mulf in program order.
     if (loadToInfo.count(loadOp) == 0)
       continue;
     // Non-LoadOp(s) are the root uses of all LoadOp(s) and should be
     // always present in the opInfo
     if (!isa<tt::LoadOp>(use)) {
+      // We can't have both INCLUDE_MULF and SWP_FIRST_DOT
+      // SWP_FIRST_DOT:
+      //   firstDot: numStages - 2, rootUsersCluster
+      //   restDot: numStages - 1, rootUsersCluster
+      // INCLUDE_MULF
+      //   firstDot: numStages - 2, rootUsersCluster
+      //   secondDot: numStages - 2, nextNextCluster
+      // no SWP_FIRST_DOT nor INCLUDE_MULF: numStages - 1, rootUsersCluster
       if (::triton::tools::getBoolEnv("SWP_FIRST_DOT")) {
-        // check to see if it is first dot.
-        schedule.insert(use, firstDot ? numStages - 2 : numStages - 1,
-                        rootUsersCluster);
-        firstDot = false;
+        if (use->hasTrait<OpTrait::DotLike>()) {
+          // check to see if it is first dot.
+          schedule.insertIfAbsent(use, firstDot ? numStages - 2 : numStages - 1,
+                                  rootUsersCluster);
+          firstDot = false;
+        }
+      } else if (::triton::tools::getBoolEnv("INCLUDE_MULF")) {
+        if (use->hasTrait<OpTrait::DotLike>()) {
+          schedule.insertIfAbsent(use, numStages - 2,
+                                  firstDot ? rootUsersCluster
+                                           : nextNextCluster);
+          firstDot = false;
+        }
+        if (isHeavyMulf(use)) {
+          // first mul in numStages - 2, nextNextCluster
+          // second mul in numStages - 1, nextCluster
+          schedule.insertIfAbsent(use,
+                                  firstMulF ? numStages - 2 : numStages - 1,
+                                  firstMulF ? nextNextCluster : nextCluster);
+          firstMulF = false;
+        }
       } else {
-        schedule.insert(use, numStages - 1, rootUsersCluster);
+        schedule.insertIfAbsent(use, numStages - 1, rootUsersCluster);
       }
       rootUsers.insert(use);
     }
@@ -631,6 +687,7 @@ static tt::CoarseSchedule::Cluster
 schedulePrologueAndEpilogue(scf::ForOp forOp, tt::CoarseSchedule &schedule,
                             DenseSet<Operation *> &rootUsers, int numStages) {
   tt::CoarseSchedule::Cluster afterPrologue = schedule.clusters.begin();
+  return afterPrologue;
 
   // Look for the IfOp that is in the backward slice any of the currently
   // scheduled ops and put it at the beginning of the loop.
@@ -1116,6 +1173,10 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
     LDBG("Coarse schedule loads only:");
     coarseSchedule.dump();
   });
+  {
+    ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
+    moduleOp.dump();
+  }
 
   SmallVector<Value> barriers;
   DenseMap<Operation *, Operation *> TMAUserToWait;
@@ -1127,6 +1188,10 @@ bool mlir::triton::preProcessLoopAndGetSchedule(
     LDBG("Coarse schedule with async loads:");
     coarseSchedule.dump();
   });
+  {
+    ModuleOp moduleOp = forOp->getParentOfType<ModuleOp>();
+    moduleOp.dump();
+  }
 
   tt::CoarseSchedule::Cluster afterPrologue =
       schedulePrologueAndEpilogue(forOp, coarseSchedule, rootUsers, numStages);
@@ -1519,7 +1584,8 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
   // For the first dot that is in a different stage, it is only used by yield
   // For the second dot, it is only used by yield, will be used by the next
   // iteration
-  if (::triton::tools::getBoolEnv("SWP_FIRST_DOT")) {
+  if (::triton::tools::getBoolEnv("SWP_FIRST_DOT") ||
+      ::triton::tools::getBoolEnv("INCLUDE_MULF")) {
     // if (firstDot) return iterArgIdx;
     return iterArgIdx;
   }

@@ -74,6 +74,8 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     return op;
   }
 
+  if (isa<ttng::WarpGroupDotOp>(op))
+    return op;
   // TODO: create if statement around wait_barrier
   if (auto wait = dyn_cast<ttng::WaitBarrierOp>(op)) {
     rewriter.setInsertionPoint(wait);

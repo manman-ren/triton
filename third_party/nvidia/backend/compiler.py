@@ -24,6 +24,7 @@ def _path_to_binary(binary: str):
         os.path.join(os.path.dirname(__file__), "bin", binary),
     ]
 
+    #print(paths)
     for bin in paths:
         if os.path.exists(bin) and os.path.isfile(bin):
             result = subprocess.check_output([bin, "--version"], stderr=subprocess.STDOUT)
@@ -301,6 +302,7 @@ class CUDABackend(BaseBackend):
     @staticmethod
     def make_cubin(src, metadata, opt, capability):
         ptxas, _ = _path_to_binary("ptxas")
+        #print(ptxas)
         with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \
             tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
             fsrc.write(src)

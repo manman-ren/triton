@@ -32,6 +32,7 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "NVPTX_ENABLE_DUMP",
     "SWP_FIRST_DOT",
     "PEEL_EPILOGUE",
+    "PEEL_LAST_ITER",
     "LOAD_DIFFERENT_STAGE",
     "INCLUDE_MULF",
     "FIRST_LOAD_OF_USE",

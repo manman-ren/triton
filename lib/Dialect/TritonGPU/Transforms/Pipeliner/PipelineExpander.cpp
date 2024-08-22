@@ -455,8 +455,10 @@ scf::ForOp LoopPipelinerInternal::createKernelLoop(
     Type t = ub.getType();
     Location loc = forOp.getLoc();
     // newUb = ub - maxStage * step
+    // peel last iteration of ops, newUb = ub - step
+    bool PeelLastIter = ::triton::tools::getBoolEnv("PEEL_LAST_ITER");
     Value maxStageValue = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getIntegerAttr(t, maxStage));
+        loc, rewriter.getIntegerAttr(t, PeelLastIter ? 1 : maxStage));
     Value maxStageByStep =
         rewriter.create<arith::MulIOp>(loc, step, maxStageValue);
     newUb = rewriter.create<arith::SubIOp>(loc, ub, maxStageByStep);
@@ -488,11 +490,16 @@ LogicalResult LoopPipelinerInternal::createKernel(
     mapping.map(arg.value(), newForOp.getRegionIterArgs()[arg.index()]);
   }
   SmallVector<Value> predicates(maxStage + 1, nullptr);
-  if (!peelEpilogue) {
+  bool PeelLastIter = ::triton::tools::getBoolEnv("PEEL_LAST_ITER");
+  if (!peelEpilogue || PeelLastIter) {
     // Create a predicate for each stage except the last stage.
     Location loc = newForOp.getLoc();
     Type t = ub.getType();
-    for (unsigned i = 0; i < maxStage; i++) {
+    // predicates[i] = indVar < c = indVar < ub - (maxStage - i) * step
+    // if peeling last iteration only, S2 should always be executed.
+    // only create predicates for S0 to S1
+    int iEnd = PeelLastIter ? maxStage - 1 : maxStage;
+    for (unsigned i = 0; i < iEnd; i++) {
       // c = ub - (maxStage - i) * step
       Value c = rewriter.create<arith::SubIOp>(
           loc, ub,
@@ -615,6 +622,7 @@ LogicalResult LoopPipelinerInternal::createKernel(
     yieldOperands.push_back(source);
   }
 
+  // bool PeelLastIter = ::triton::tools::getBoolEnv("PEEL_LAST_ITER");
   for (auto &it : crossStageValues) {
     int64_t version = maxStage - it.second.lastUseStage + 1;
     unsigned numVersionReturned = it.second.lastUseStage - it.second.defStage;
@@ -628,6 +636,9 @@ LogicalResult LoopPipelinerInternal::createKernel(
           newForOp.getBody()->getArguments()[yieldOperands.size() + 1 +
                                              newForOp.getNumInductionVars()]);
     }
+    // Map [key, version] to result of newForOp.
+    if (PeelLastIter)
+      ++version; // loop body contains the first epilogue
     setValueMapping(it.first, newForOp->getResult(yieldOperands.size()),
                     version++);
     yieldOperands.push_back(mapping.lookupOrDefault(it.first));
@@ -643,10 +654,13 @@ LogicalResult LoopPipelinerInternal::createKernel(
       for (unsigned int stage = 1; stage <= maxStage; stage++)
         setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
                         retVal.value(), stage);
-    } else if (defStage->second > 0) {
+    } else if (defStage->second > 0 &&
+               (!PeelLastIter || defStage->second > 1)) {
+      // If PeelLastIter is false, no change. If it is true, only enter when
+      // defStage->second is bigger than 1.
       setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
                       newForOp->getResult(retVal.index()),
-                      maxStage - defStage->second + 1);
+                      maxStage - defStage->second + 1 + (PeelLastIter ? 1 : 0));
     }
   }
   rewriter.create<scf::YieldOp>(forOp.getLoc(), yieldOperands);
@@ -657,6 +671,7 @@ void LoopPipelinerInternal::emitEpilogue(
     RewriterBase &rewriter, llvm::SmallVector<Value> &returnValues) {
   // Emit different versions of the induction variable. They will be
   // removed by dead code if not used.
+  bool PeelLastIter = ::triton::tools::getBoolEnv("PEEL_LAST_ITER");
   for (int64_t i = 0; i < maxStage; i++) {
     Location loc = forOp.getLoc();
     Type t = lb.getType();
@@ -680,7 +695,7 @@ void LoopPipelinerInternal::emitEpilogue(
   }
   // Emit `maxStage - 1` epilogue part that includes operations from stages
   // [i; maxStage].
-  for (int64_t i = 1; i <= maxStage; i++) {
+  for (int64_t i = PeelLastIter ? maxStage : 1; i <= maxStage; i++) {
     for (Operation *op : opOrder) {
       if (stages[op] < i)
         continue;

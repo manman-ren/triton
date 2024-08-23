@@ -630,6 +630,12 @@ LogicalResult LoopPipelinerInternal::createKernel(
     // If there is a live range spanning across more than 2 stages we need to
     // add extra arg.
     for (unsigned i = 1; i < numVersionReturned; i++) {
+      LLVM_DEBUG({
+        llvm::dbgs() << "set valueMapping3: version " << version
+                     << " lastUseStage " << it.second.lastUseStage
+                     << " defStage " << it.second.defStage << " ";
+        it.first.dump();
+      });
       setValueMapping(it.first, newForOp->getResult(yieldOperands.size()),
                       version++);
       yieldOperands.push_back(
@@ -637,8 +643,18 @@ LogicalResult LoopPipelinerInternal::createKernel(
                                              newForOp.getNumInductionVars()]);
     }
     // Map [key, version] to result of newForOp.
-    if (PeelLastIter)
-      ++version; // loop body contains the first epilogue
+#if 1
+    if (PeelLastIter && it.second.lastUseStage == maxStage) {
+      // we only need version maxStage for ops in stage maxStage
+      version += maxStage - 1; // loop body contains the first epilogue
+    }
+#endif
+    LLVM_DEBUG({
+      llvm::dbgs() << "set valueMapping: version " << version
+                   << " lastUseStage " << it.second.lastUseStage << " defStage "
+                   << it.second.defStage << " ";
+      it.first.dump();
+    });
     setValueMapping(it.first, newForOp->getResult(yieldOperands.size()),
                     version++);
     yieldOperands.push_back(mapping.lookupOrDefault(it.first));
@@ -654,14 +670,26 @@ LogicalResult LoopPipelinerInternal::createKernel(
       for (unsigned int stage = 1; stage <= maxStage; stage++)
         setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
                         retVal.value(), stage);
+#if 0
+    } else if (defStage->second > 0) {
+      llvm::errs() << "set valueMapping2: version " << maxStage - defStage->second + 1 << " ";
+      forOp.getRegionIterArgs()[retVal.index()].dump();
+      setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
+                      newForOp->getResult(retVal.index()),
+                      maxStage - defStage->second + 1);
+    }
+#endif
+#if 1
     } else if (defStage->second > 0 &&
-               (!PeelLastIter || defStage->second > 1)) {
+               (!PeelLastIter || defStage->second > maxStage - 1)) {
       // If PeelLastIter is false, no change. If it is true, only enter when
       // defStage->second is bigger than 1.
       setValueMapping(forOp.getRegionIterArgs()[retVal.index()],
                       newForOp->getResult(retVal.index()),
-                      maxStage - defStage->second + 1 + (PeelLastIter ? 1 : 0));
+                      maxStage - defStage->second + 1 +
+                          (PeelLastIter ? maxStage - 1 : 0));
     }
+#endif
   }
   rewriter.create<scf::YieldOp>(forOp.getLoc(), yieldOperands);
   return success();
@@ -699,11 +727,29 @@ void LoopPipelinerInternal::emitEpilogue(
     for (Operation *op : opOrder) {
       if (stages[op] < i)
         continue;
+      LLVM_DEBUG({
+        llvm::errs() << "clone ";
+        op->dump();
+      });
       Operation *newOp =
           cloneAndUpdateOperands(rewriter, op, [&](OpOperand *newOperand) {
             auto it = valueMapping.find(newOperand->get());
             if (it != valueMapping.end()) {
-              Value replacement = it->second[maxStage - stages[op] + i];
+              LLVM_DEBUG({
+                llvm::errs() << "find valueMapping: version "
+                             << (maxStage - stages[op] + i) << " ";
+                newOperand->get().dump();
+                unsigned tmp = 0;
+                for (auto v : it->second) {
+                  llvm::errs() << "idx " << tmp << ": ";
+                  v.dump();
+                  ++tmp;
+                }
+              });
+              // When PeelLastIter is true, we need maxStage - stages[op] + 1
+              Value replacement =
+                  it->second[maxStage - stages[op] + (PeelLastIter ? i : i)];
+              // replacement.dump();
               newOperand->set(replacement);
             }
           });

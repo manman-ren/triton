@@ -333,6 +333,20 @@ getSharedEncoding(Operation *loadOp, bool isMMAV3) {
 }
 
 static bool isHeavyMulf(Operation *op) {
+  if (::triton::tools::getBoolEnv("SWP_SECOND_DOT")) {
+    // include exp2, mulf, addf 1D. Somehow we don't go through reduction
+    // when checking dependencies
+    if (!isa<arith::MulFOp>(op) && !isa<math::Exp2Op>(op) &&
+        !isa<arith::AddFOp>(op))
+      return false;
+    auto tensorTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    if (!tensorTy)
+      return false;
+    if (tensorTy.getRank() < 1)
+      return false;
+    return true;
+  }
+
   if (!isa<arith::MulFOp>(op))
     return false;
   auto tensorTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
@@ -580,12 +594,26 @@ scheduleLoads(scf::ForOp forOp, tt::CoarseSchedule &schedule,
 
   tt::CoarseSchedule::Cluster rootUsersCluster = schedule.clusters.newAtFront();
   // Put the root uses of the loads in the last stage.
-  // When INCLUDE_MULF is true, use fixed schedule:
+  // When INCLUDE_MULF is true, use fixed schedule for blockwise:
   //   We can't put two dots in different stages as they use the same loaded
   //   value second mul is in numStages - 1, rest in numStages - 2 first dot in
   //   rootUsersCluster, seond mul in nextCluster, second dot and mul0 are in
   //   nextNextCluster Need to make sure mul0 is after second dot in program
   //   order
+  //   Dot0(i+1)
+  //   MUL1(i)
+  //   Dot1(i+1)
+  //   MUL0(i+1)
+  // for the case of flash attention option 1:
+  //   Dot0(i+1)
+  //   Dot1(i)
+  //   Softmax(i): includes MUL0(i)
+  //   MUL1(i)
+  // for the case of flash attention option 2:
+  //   Dot0(i+1)
+  //   Dot1(i)
+  //   Softmax(i+1): includes MUL0(i+1)
+  //   MUL1(i+1)
   bool firstDot = true, firstMulF = true;
   tt::CoarseSchedule::Cluster nextCluster = rootUsersCluster;
   tt::CoarseSchedule::Cluster nextNextCluster = rootUsersCluster;
@@ -601,12 +629,16 @@ scheduleLoads(scf::ForOp forOp, tt::CoarseSchedule &schedule,
     // always present in the opInfo
     if (!isa<tt::LoadOp>(use)) {
       // We can't have both INCLUDE_MULF and SWP_FIRST_DOT
-      // SWP_FIRST_DOT:
+      // SWP_FIRST_DOT: for FA's 1st option
       //   firstDot: numStages - 2, rootUsersCluster
       //   restDot: numStages - 1, rootUsersCluster
-      // INCLUDE_MULF
+      // INCLUDE_MULF: for blockwise
       //   firstDot: numStages - 2, rootUsersCluster
       //   secondDot: numStages - 2, nextNextCluster
+      // SWP_SECOND_DOT + INCLUDE_MULF: for FA's 2nd option
+      // When SWP_SECOND_DOT is true INCLUDE_MULF must be true
+      //   firstDot: numStages - 2, rootUsersCluster
+      //   restDot: numStages - 1, nextCluster
       // no SWP_FIRST_DOT nor INCLUDE_MULF: numStages - 1, rootUsersCluster
       if (::triton::tools::getBoolEnv("SWP_FIRST_DOT")) {
         if (use->hasTrait<OpTrait::DotLike>()) {
@@ -617,17 +649,29 @@ scheduleLoads(scf::ForOp forOp, tt::CoarseSchedule &schedule,
         }
       } else if (::triton::tools::getBoolEnv("INCLUDE_MULF")) {
         if (use->hasTrait<OpTrait::DotLike>()) {
-          schedule.insertIfAbsent(use, numStages - 2,
-                                  firstDot ? rootUsersCluster
-                                           : nextNextCluster);
+          if (::triton::tools::getBoolEnv("SWP_SECOND_DOT")) {
+            schedule.insertIfAbsent(use,
+                                    firstDot ? numStages - 2 : numStages - 1,
+                                    firstDot ? rootUsersCluster : nextCluster);
+          } else {
+            schedule.insertIfAbsent(use, numStages - 2,
+                                    firstDot ? rootUsersCluster
+                                             : nextNextCluster);
+          }
           firstDot = false;
         }
         if (isHeavyMulf(use)) {
-          // first mul in numStages - 2, nextNextCluster
-          // second mul in numStages - 1, nextCluster
-          schedule.insertIfAbsent(use,
-                                  firstMulF ? numStages - 2 : numStages - 1,
-                                  firstMulF ? nextNextCluster : nextCluster);
+          if (::triton::tools::getBoolEnv("SWP_SECOND_DOT")) {
+            // first mul in numStages - 2, nextNextCluster
+            // second mul in numStages - 2, nextNextCluster
+            schedule.insertIfAbsent(use, numStages - 2, nextNextCluster);
+          } else {
+            // first mul in numStages - 2, nextNextCluster
+            // second mul in numStages - 1, nextCluster
+            schedule.insertIfAbsent(use,
+                                    firstMulF ? numStages - 2 : numStages - 1,
+                                    firstMulF ? nextNextCluster : nextCluster);
+          }
           firstMulF = false;
         }
       } else {
@@ -1557,6 +1601,11 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
         iterArg = forOp.getRegionIterArg(argIdx);
         continue;
       }
+      // MMA0 is used but MMA1 is used later, we can have pendings of 1 before
+      // use of MMA0 since MMA1 is pending, and we will have pendings of 0
+      // before use of MMA1.
+      if (::triton::tools::getBoolEnv("HACK_DOT_ASYNC"))
+        continue;
       LDBG("Can't make dot async because dot is unconditionally used in the "
            "loop.");
       return std::nullopt;
@@ -1573,6 +1622,9 @@ static std::optional<int> dotCanBeProperlyAsync(ttng::WarpGroupDotOp dotOp,
       return std::nullopt;
     }
   }
+
+  if (iterArg == nullptr && ::triton::tools::getBoolEnv("HACK_DOT_ASYNC"))
+    return -1;
 
   // Rule 3a: Are the only users of the dot's result from iteration i-1 other
   // MMAv3 dots?  If so, we're done, this dot can be properly async.
@@ -1652,6 +1704,7 @@ static void insertAsyncWarpGroupDotWaitInLoop(
 
   // Insert waits before the users of the properly async dots other than loop
   // yield.
+  bool firstDot = true;
   for (auto [asyncDot, iterArgIdx] : properlyAsyncDots) {
     SmallVector<OpOperand *> uses;
     for (auto &use : asyncDot->getUses()) {
@@ -1661,19 +1714,38 @@ static void insertAsyncWarpGroupDotWaitInLoop(
       uses.push_back(&use);
     }
 
-    DenseMap<Block *, SmallVector<Value>> blockToUsers;
+    // values used by this operand
+    DenseMap<Block *, SmallVector<Value>> blockToUsedValues;
+    DenseMap<Block *, SmallVector<Operation *>> blockToUsers;
     for (auto use : uses) {
       auto block = use->getOwner()->getBlock();
-      blockToUsers[block].push_back(use->get());
+      blockToUsedValues[block].push_back(use->get());
+      blockToUsers[block].push_back(use->getOwner());
     }
 
-    for (auto [block, users] : blockToUsers) {
-      OpBuilder builder(block, block->begin());
-      auto newWait = builder.create<ttng::WarpGroupDotWaitOp>(
-          asyncDot->getLoc(), ArrayRef<Value>{}, 0);
-
-      threadValuesThroughWait(newWait, users);
+    // Why are we inserting to the beginning?
+    for (auto [block, usedValues] : blockToUsedValues) {
+      if (::triton::tools::getBoolEnv("HACK_DOT_ASYNC")) {
+        // IRRewriter builder2(forOp.getContext());
+        //  after the first user
+        // llvm::dbgs() << "first user for the block\n";
+        // blockToUsers[block][0]->dump();
+        OpBuilder builder(blockToUsers[block][0]);
+        // builder2.setInsertionPointBefore(blockToUsers[block][0]);
+        //  For use of first dot, use pendings = 1.
+        unsigned pendings = firstDot ? 1 : 0;
+        auto newWait = builder.create<ttng::WarpGroupDotWaitOp>(
+            asyncDot->getLoc(), ArrayRef<Value>{}, pendings);
+        threadValuesThroughWait(newWait, usedValues);
+      } else {
+        OpBuilder builder(block, block->begin());
+        auto newWait = builder.create<ttng::WarpGroupDotWaitOp>(
+            asyncDot->getLoc(), ArrayRef<Value>{}, 0);
+        threadValuesThroughWait(newWait, usedValues);
+      }
+      // forOp.dump();
     }
+    firstDot = false;
   }
 
   // Add the wait right after the last properly-async dot.  This only needs to
@@ -1684,19 +1756,21 @@ static void insertAsyncWarpGroupDotWaitInLoop(
   // after the last dot, but there could be a load into shmem between the last
   // async dot and the end of the loop, and that could clobber memory being used
   // by a dot.)
-  IRRewriter builder(forOp.getContext());
-  auto lastAsyncDot = properlyAsyncDots.back().first;
-  builder.setInsertionPointAfter(lastAsyncDot);
-  auto wait = builder.create<ttng::WarpGroupDotWaitOp>(
-      lastAsyncDot->getLoc(),
-      /*inputs=*/ArrayRef<Value>{}, properlyAsyncDots.size());
+  if (!::triton::tools::getBoolEnv("HACK_DOT_ASYNC")) {
+    IRRewriter builder(forOp.getContext());
+    auto lastAsyncDot = properlyAsyncDots.back().first;
+    builder.setInsertionPointAfter(lastAsyncDot);
+    auto wait = builder.create<ttng::WarpGroupDotWaitOp>(
+        lastAsyncDot->getLoc(),
+        /*inputs=*/ArrayRef<Value>{}, properlyAsyncDots.size());
 
-  // Thread the results of the async dots through the wait.
-  SmallVector<Value> addlWaitOperands;
-  for (auto [asyncDot, iterArgIdx] : properlyAsyncDots) {
-    addlWaitOperands.push_back(asyncDot->getResult(0));
+    // Thread the results of the async dots through the wait.
+    SmallVector<Value> addlWaitOperands;
+    for (auto [asyncDot, iterArgIdx] : properlyAsyncDots) {
+      addlWaitOperands.push_back(asyncDot->getResult(0));
+    }
+    threadValuesThroughWait(wait, addlWaitOperands);
   }
-  threadValuesThroughWait(wait, addlWaitOperands);
 }
 
 // Convert MMAv3 ttng::WarpGroupDotOps {isAsync = False} (i.e. Hopper wgmma)
@@ -1755,6 +1829,8 @@ void triton::asyncLaunchDots(scf::ForOp forOp) {
   // iteration of the loop.
   SmallVector<Value> waitOperands;
   for (auto [asyncDot, iterArgIdx] : properlyAsyncDots) {
+    if (::triton::tools::getBoolEnv("HACK_DOT_ASYNC") && iterArgIdx == -1)
+      continue;
     waitOperands.push_back(forOp.getResult(iterArgIdx));
   }
   // Wait until there are 0 outstanding async dot ops.

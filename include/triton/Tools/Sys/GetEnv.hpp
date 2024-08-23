@@ -36,6 +36,8 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "INCLUDE_MULF",
     "FIRST_LOAD_OF_USE",
     "BYPASS_IF_HANDLING",
+    "SWP_SECOND_DOT",
+    "HACK_DOT_ASYNC",
     // clang-format on
 };
 

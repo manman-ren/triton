@@ -138,6 +138,13 @@ schedulePrologueAndEpilogue(scf::ForOp forOp, tt::CoarseSchedule &schedule,
   return afterPrologue;
 }
 
+static const char *kLoopScheduleAttrName = "tt.loop_schedule";
+std::string getLoopScheduleOrDefault(scf::ForOp forOp) {
+  if (!forOp->hasAttr(kLoopScheduleAttrName))
+    return "default";
+  return (cast<StringAttr>(forOp->getAttr(kLoopScheduleAttrName))).str();
+}
+
 #define GEN_PASS_DEF_TRITONGPULOOPSCHEDULING
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
@@ -157,6 +164,20 @@ public:
         .getInt();
   }
 
+  tt::CoarseSchedule::Cluster
+  getDefaultLoopSchedule(scf::ForOp forOp, tt::CoarseSchedule &schedule,
+                         int numStages) {
+    DenseSet<Operation *> rootUsers;
+    scheduleLoads(forOp, schedule, rootUsers, numStages);
+    return schedulePrologueAndEpilogue(forOp, schedule, rootUsers, numStages);
+  }
+
+  tt::CoarseSchedule::Cluster
+  getFAFirstDotSchedule(scf::ForOp forOp, tt::CoarseSchedule &schedule,
+                        int numStages) {
+    return schedule.clusters.begin();
+  }
+
   void runOnOperation() override {
     SmallVector<scf::ForOp> loops;
     getOperation()->walk([&](scf::ForOp forOp) {
@@ -169,11 +190,17 @@ public:
       return;
     for (scf::ForOp forOp : loops) {
       int loopNumStages = getNumStagesOrDefault(forOp);
-      DenseSet<Operation *> rootUsers;
       tt::CoarseSchedule coarseSchedule(loopNumStages);
-      scheduleLoads(forOp, coarseSchedule, rootUsers, loopNumStages);
-      tt::CoarseSchedule::Cluster afterPrologue = schedulePrologueAndEpilogue(
-          forOp, coarseSchedule, rootUsers, loopNumStages);
+      tt::CoarseSchedule::Cluster afterPrologue;
+
+      std::string loopSchedule = getLoopScheduleOrDefault(forOp);
+      if (loopSchedule == "default") {
+        afterPrologue =
+            getDefaultLoopSchedule(forOp, coarseSchedule, loopNumStages);
+      } else if (loopSchedule == "FA_firstDot") {
+      } else {
+        assert(false && "unrecognized loop schedule");
+      }
       // Go through schedule and assign (stage, cluster).
       // shift so afterPrologue will be at clusterId 0
       auto ctx = forOp.getContext();

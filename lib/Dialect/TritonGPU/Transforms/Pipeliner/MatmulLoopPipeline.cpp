@@ -588,6 +588,12 @@ getLoopSchedule(scf::ForOp forOp, tt::CoarseSchedule &schedule,
     dfsUse(loadOp, loadOp);
   }
   for (auto [loadOp, use] : loadOpToDirectUses) {
+    LLVM_DEBUG({
+      LDBG("loadOpToDirectUses " << schedule[use].first << " "
+                                 << schedule[loadOp].first);
+      loadOp->dump();
+      use->dump();
+    });
     loadToInfo[loadOp].distToUse = schedule[use].first - schedule[loadOp].first;
   }
 

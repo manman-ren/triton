@@ -172,9 +172,101 @@ public:
     return schedulePrologueAndEpilogue(forOp, schedule, rootUsers, numStages);
   }
 
+  bool isFlashAttention(scf::ForOp forOp, SmallVector<Operation *> &keyOps) {
+    SmallVector<Operation *> loads;
+    SmallVector<Operation *> dots;
+    for (Operation &op : forOp.getBody()->without_terminator()) {
+      // Check for loop-carried dependencies.
+      // We have two loadOps, one feeding the first dot, and the other feeding
+      // the second dot.
+      if (isa<tt::LoadOp, tt::ExperimentalDescriptorLoadOp>(op)) {
+        loads.push_back(&op);
+      }
+      if (op.hasTrait<OpTrait::DotLike>()) {
+        dots.push_back(&op);
+      }
+    }
+    if (dots.size() != 2 || loads.size() != 2)
+      return false;
+
+    Operation *secondDot = dots[1];
+    DenseSet<Operation *> seen;
+    DenseSet<Operation *> tracedDots;
+    // Make sure there is a dependency path from firstDot to secondDot.
+    // This means we need to do computation pipelining to break the dependency.
+    std::function<void(Operation * op)> dfs = [&](Operation *op) {
+      if (!seen.insert(op).second)
+        return;
+      for (Value operand : op->getOperands()) {
+        Value v = operand;
+        Operation *defOp = v.getDefiningOp();
+        if (defOp && defOp->getBlock() == op->getBlock()) {
+          if (defOp->hasTrait<OpTrait::DotLike>()) {
+            // Stop tracing when hitting a dot.
+            tracedDots.insert(defOp);
+          } else
+            dfs(defOp);
+        }
+      }
+    };
+    dfs(secondDot);
+    if (tracedDots.size() != 1)
+      return false;
+
+    llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
+        loadOpToIndLevelAndUse =
+            mlir::triton::loadOpsToIndirectionLevelAndUse(forOp);
+    LLVM_DEBUG({
+      LDBG("Found " << loadOpToIndLevelAndUse.size() << " loads to pipeline:");
+      for (const auto &[l, i, u] : loadOpToIndLevelAndUse) {
+        LDBG("  - load: " << *l);
+        LDBG("    at indirection level: " << i);
+        LDBG("    used by op: " << *u);
+      }
+    });
+    if (loadOpToIndLevelAndUse.empty())
+      return false;
+
+    for (auto [loadOp, dist, use] : loadOpToIndLevelAndUse) {
+      if (dist != 0)
+        return false;
+    }
+
+    keyOps.push_back(loads[0]); // FIXME
+    keyOps.push_back(loads[1]);
+    keyOps.push_back(dots[0]);
+    keyOps.push_back(secondDot);
+    return true;
+  }
+
   tt::CoarseSchedule::Cluster
   getFAFirstDotSchedule(scf::ForOp forOp, tt::CoarseSchedule &schedule,
                         int numStages) {
+    // Check to see if the for loop matches the pattern for flash attention.
+    // If yes, move the first dot to its own stage (numStages - 2), the
+    // rest of the computation will be in stage (numStages - 1). The two loads
+    // will be in stage 0 and 1.
+    SmallVector<Operation *> keyOps;
+    if (!isFlashAttention(forOp, keyOps))
+      return schedule.clusters.begin();
+    // firstLoad: keyOps[0]
+    tt::CoarseSchedule::Cluster rootUsersCluster =
+        schedule.clusters.newAtFront();
+    tt::CoarseSchedule::Cluster loadCluster = schedule.clusters.newAtBack();
+    schedule.insert(keyOps[0], 0, loadCluster);
+    schedule.insert(keyOps[1], 1, loadCluster);
+    schedule.insert(keyOps[2], numStages - 2, rootUsersCluster);
+    schedule.insert(keyOps[3], numStages - 1, rootUsersCluster);
+    return schedule.clusters.begin();
+  }
+
+  tt::CoarseSchedule::Cluster
+  getFASecondDotSchedule(scf::ForOp forOp, tt::CoarseSchedule &schedule,
+                         int numStages) {
+    // Check to see if the for loop matches the pattern for flash attention.
+    // If yes, move the second dot to its own stage (numStages - 1), the
+    // rest of the computation will be in stage (numStages - 2). The two loads
+    // will be in stage 0 and 1.
     return schedule.clusters.begin();
   }
 
@@ -198,6 +290,11 @@ public:
         afterPrologue =
             getDefaultLoopSchedule(forOp, coarseSchedule, loopNumStages);
       } else if (loopSchedule == "FA_firstDot") {
+        afterPrologue =
+            getFAFirstDotSchedule(forOp, coarseSchedule, loopNumStages);
+      } else if (loopSchedule == "FA_secondDot") {
+        afterPrologue =
+            getFASecondDotSchedule(forOp, coarseSchedule, loopNumStages);
       } else {
         assert(false && "unrecognized loop schedule");
       }

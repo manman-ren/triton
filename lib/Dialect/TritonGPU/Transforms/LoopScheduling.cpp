@@ -247,8 +247,10 @@ public:
     // rest of the computation will be in stage (numStages - 1). The two loads
     // will be in stage 0 and 1.
     SmallVector<Operation *> keyOps;
-    if (!isFlashAttention(forOp, keyOps))
+    if (!isFlashAttention(forOp, keyOps)) {
+      LDBG("isFlashAttention returns false");
       return schedule.clusters.begin();
+    }
     // firstLoad: keyOps[0]
     tt::CoarseSchedule::Cluster rootUsersCluster =
         schedule.clusters.newAtFront();

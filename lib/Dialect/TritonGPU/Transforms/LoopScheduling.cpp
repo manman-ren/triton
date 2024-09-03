@@ -145,6 +145,20 @@ std::string getLoopScheduleOrDefault(scf::ForOp forOp) {
   return (cast<StringAttr>(forOp->getAttr(kLoopScheduleAttrName))).str();
 }
 
+static bool isHeavyComputation(Operation *op) {
+  // include exp2, mulf, addf 1D. Somehow we don't go through reduction
+  // when checking dependencies
+  if (!isa<arith::MulFOp>(op) && !isa<math::Exp2Op>(op) &&
+      !isa<arith::AddFOp>(op))
+    return false;
+  auto tensorTy = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+  if (!tensorTy)
+    return false;
+  if (tensorTy.getRank() < 1)
+    return false;
+  return true;
+}
+
 #define GEN_PASS_DEF_TRITONGPULOOPSCHEDULING
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
@@ -172,7 +186,12 @@ public:
     return schedulePrologueAndEpilogue(forOp, schedule, rootUsers, numStages);
   }
 
-  bool isFlashAttention(scf::ForOp forOp, SmallVector<Operation *> &keyOps) {
+  bool
+  isFlashAttention(scf::ForOp forOp,
+                   llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
+                       &loadOpToIndLevelAndUse,
+                   SmallVector<Operation *> &keyOps,
+                   DenseSet<Operation *> &heavyCompOps) {
     SmallVector<Operation *> loads;
     SmallVector<Operation *> dots;
     for (Operation &op : forOp.getBody()->without_terminator()) {
@@ -204,27 +223,16 @@ public:
           if (defOp->hasTrait<OpTrait::DotLike>()) {
             // Stop tracing when hitting a dot.
             tracedDots.insert(defOp);
-          } else
+          } else {
+            if (isHeavyComputation(defOp))
+              heavyCompOps.insert(defOp);
             dfs(defOp);
+          }
         }
       }
     };
     dfs(secondDot);
     if (tracedDots.size() != 1)
-      return false;
-
-    llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
-        loadOpToIndLevelAndUse =
-            mlir::triton::loadOpsToIndirectionLevelAndUse(forOp);
-    LLVM_DEBUG({
-      LDBG("Found " << loadOpToIndLevelAndUse.size() << " loads to pipeline:");
-      for (const auto &[l, i, u] : loadOpToIndLevelAndUse) {
-        LDBG("  - load: " << *l);
-        LDBG("    at indirection level: " << i);
-        LDBG("    used by op: " << *u);
-      }
-    });
-    if (loadOpToIndLevelAndUse.empty())
       return false;
 
     for (auto [loadOp, dist, use] : loadOpToIndLevelAndUse) {
@@ -242,12 +250,28 @@ public:
   tt::CoarseSchedule::Cluster
   getFAFirstDotSchedule(scf::ForOp forOp, tt::CoarseSchedule &schedule,
                         int numStages) {
+    llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
+        loadOpToIndLevelAndUse =
+            mlir::triton::loadOpsToIndirectionLevelAndUse(forOp);
+    LLVM_DEBUG({
+      LDBG("Found " << loadOpToIndLevelAndUse.size() << " loads to pipeline:");
+      for (const auto &[l, i, u] : loadOpToIndLevelAndUse) {
+        LDBG("  - load: " << *l);
+        LDBG("    at indirection level: " << i);
+        LDBG("    used by op: " << *u);
+      }
+    });
+    if (loadOpToIndLevelAndUse.empty())
+      return schedule.clusters.begin();
+
     // Check to see if the for loop matches the pattern for flash attention.
     // If yes, move the first dot to its own stage (numStages - 2), the
     // rest of the computation will be in stage (numStages - 1). The two loads
     // will be in stage 0 and 1.
     SmallVector<Operation *> keyOps;
-    if (!isFlashAttention(forOp, keyOps)) {
+    DenseSet<Operation *> heavyCompOps;
+    if (!isFlashAttention(forOp, loadOpToIndLevelAndUse, keyOps,
+                          heavyCompOps)) {
       LDBG("isFlashAttention returns false");
       return schedule.clusters.begin();
     }
@@ -265,10 +289,53 @@ public:
   tt::CoarseSchedule::Cluster
   getFASecondDotSchedule(scf::ForOp forOp, tt::CoarseSchedule &schedule,
                          int numStages) {
+    llvm::SmallVector<std::tuple<Operation *, int, Operation *>>
+        loadOpToIndLevelAndUse =
+            mlir::triton::loadOpsToIndirectionLevelAndUse(forOp);
+    LLVM_DEBUG({
+      LDBG("Found " << loadOpToIndLevelAndUse.size() << " loads to pipeline:");
+      for (const auto &[l, i, u] : loadOpToIndLevelAndUse) {
+        LDBG("  - load: " << *l);
+        LDBG("    at indirection level: " << i);
+        LDBG("    used by op: " << *u);
+      }
+    });
+    if (loadOpToIndLevelAndUse.empty())
+      return schedule.clusters.begin();
+
     // Check to see if the for loop matches the pattern for flash attention.
     // If yes, move the second dot to its own stage (numStages - 1), the
     // rest of the computation will be in stage (numStages - 2). The two loads
     // will be in stage 0 and 1.
+    SmallVector<Operation *> keyOps;
+    DenseSet<Operation *> heavyCompOps;
+    if (!isFlashAttention(forOp, loadOpToIndLevelAndUse, keyOps,
+                          heavyCompOps)) {
+      LDBG("isFlashAttention returns false");
+      return schedule.clusters.begin();
+    }
+    // Go through loop body
+    for (Operation &op : forOp.getBody()->without_terminator()) {
+      if (isHeavyComputation(&op))
+        heavyCompOps.insert(&op);
+    }
+    // keyOps: load0, load1, dot0, dot1
+    //   Dot0(i+1)
+    //   Dot1(i)
+    //   Softmax(i+1): includes MUL0(i+1)
+    //   MUL1(i+1)
+    tt::CoarseSchedule::Cluster rootUsersCluster =
+        schedule.clusters.newAtFront();
+    tt::CoarseSchedule::Cluster nextCluster = schedule.clusters.newAtBack();
+    tt::CoarseSchedule::Cluster nextNextCluster = schedule.clusters.newAtBack();
+    tt::CoarseSchedule::Cluster loadCluster = schedule.clusters.newAtBack();
+    schedule.insert(keyOps[0], 0, loadCluster);
+    schedule.insert(keyOps[1], 1, loadCluster);
+    schedule.insert(keyOps[2], numStages - 2, rootUsersCluster);
+    schedule.insert(keyOps[3], numStages - 1, nextCluster);
+    // Softmax(i+1), MUL1(i+1) in nextNextCluster
+    for (auto *heavyOp : heavyCompOps)
+      schedule.insert(heavyOp, numStages - 2, nextNextCluster);
     return schedule.clusters.begin();
   }
 

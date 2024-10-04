@@ -73,8 +73,32 @@ class DependenciesFinder(ast.NodeVisitor):
     def ret(self):
         return self.hasher.hexdigest()
 
+    def _is_triton_builtin(self, node, func):
+        if inspect.isbuiltin(node.func):
+            return True
+        module = getattr(func, "__module__", "")
+        return module.startswith(TRITON_MODULE)
+
+    def _update_hash(self, func):
+        if isinstance(func, JITFunction):
+            # Merge our used_global_vals with those of the called function,
+            # after checking that all overlapping values are consistent.
+            for k in self.used_global_vals.keys() & func.used_global_vals.keys():
+                var_name, _ = k
+                v1, _ = self.used_global_vals[k]
+                v2, _ = func.used_global_vals[k]
+                if v1 != v2:
+                    raise RuntimeError(
+                        f"Global variable {var_name} has value {v1} when compiling {self.name}, but inner kernel {func.__name__} has conflicting value {v2} from when it was first compiled.  This is not allowed."
+                    )
+            self.used_global_vals.update(func.used_global_vals)
+            # update hash
+            func_key = func.cache_key
+            func_key += str(getattr(func, "noinline", False))
+            self.hasher.update(func_key.encode("utf-8"))
+
     def visit_Name(self, node):
-        if type(node.ctx) == ast.Store:
+        if type(node.ctx) is ast.Store:
             return node.id
 
         if node.id in self.local_names:
@@ -93,14 +117,14 @@ class DependenciesFinder(ast.NodeVisitor):
                 and not self.visiting_arg_default_value
                 # It would be pretty evil if someone did `import x` and then
                 # `x = blah`.
-                and type(val) != ModuleType
+                and type(val) is not ModuleType
                 # It would be pretty evil if we used function `foo` inside of
                 # `bar` and then someone did `foo = baz`.
                 and not isinstance(val, JITFunction) and not getattr(val, "__triton_builtin__", False)  #
-                and node.id not in self.supported_python_builtins  #
-            ):
+                and node.id not in self.supported_python_builtins):
             self.used_global_vals[(node.id, id(self.globals))] = (val, self.globals)
 
+        self._update_hash(val)
         return val
 
     def visit_Tuple(self, node):
@@ -114,52 +138,9 @@ class DependenciesFinder(ast.NodeVisitor):
             lhs = self.visit(lhs.value)
         if lhs is None or (getattr(lhs, "__name__", "") == TRITON_MODULE):
             return None
-        return getattr(lhs, node.attr)
-
-    def visit_Call(self, node):
-
-        def is_triton_builtin(func):
-            if inspect.isbuiltin(node.func):
-                return True
-            module = getattr(func, "__module__", "")
-            return module.startswith(TRITON_MODULE)
-
-        func = self.visit(node.func)
-        assert func is None or is_triton_builtin(func) or isinstance(
-            func, JITFunction
-        ), f'Function "{func.__name__}" is being called from a Triton function but is not a Triton function itself. Decorate it with @triton.jit to fix this'
-
-        # Traverse arguments as well as node.func so we can find JITFunctions
-        # passed to tl.reduce or tl.associative_scan as the combine_fn
-        for obj in itertools.chain(
-            (func, ),
-                map(self.visit, node.args),
-            (self.visit(kw.value) for kw in node.keywords),
-        ):
-            if not isinstance(obj, JITFunction):
-                continue
-            if is_triton_builtin(obj):
-                continue
-
-            func_cache_key = obj.cache_key
-
-            # Merge our used_global_vals with those of the called function,
-            # after checking that all overlapping values are consistent.
-            for k in self.used_global_vals.keys() & obj.used_global_vals.keys():
-                var_name, _ = k
-                v1, _ = self.used_global_vals[k]
-                v2, _ = obj.used_global_vals[k]
-                if v1 != v2:
-                    raise RuntimeError(
-                        f"Global variable {var_name} has value {v1} when compiling {self.name}, but inner kernel {func.__name__} has conflicting value {v2} from when it was first compiled.  This is not allowed."
-                    )
-
-            self.used_global_vals.update(obj.used_global_vals)
-
-            noinline = str(getattr(obj, "noinline", False))
-
-            key = func_cache_key + noinline
-            self.hasher.update(key.encode("utf-8"))
+        ret = getattr(lhs, node.attr)
+        self._update_hash(ret)
+        return ret
 
     def visit_FunctionDef(self, node):
         # Save the local name, which may hide the global name.
@@ -249,10 +230,12 @@ def _normalize_ty(ty) -> str:
 class KernelParam:
     """Represents a parameter (name plus metadata) to a @jit'ed function."""
 
-    def __init__(self, num: int, param: inspect.Parameter, do_not_specialize: bool):
+    def __init__(self, num: int, param: inspect.Parameter, do_not_specialize: bool,
+                 do_not_specialize_on_alignment: bool):
         self.num = num
         self._param = param
         self.do_not_specialize = do_not_specialize
+        self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
 
     @cached_property
     def name(self):
@@ -292,13 +275,13 @@ class KernelParam:
         return self._param.default != inspect.Parameter.empty
 
 
-def compute_spec_key(v):
+def compute_spec_key(v, align):
 
-    if hasattr(v, "data_ptr") and (v.data_ptr() % 16 == 0):
+    if align and hasattr(v, "data_ptr") and (v.data_ptr() % 16 == 0):
         return "D"
     elif isinstance(v, int):
         # bool is a subclass of int, so we don't check explicitly above.
-        if (v % 16 == 0):
+        if align and (v % 16 == 0):
             return "D"
         elif v == 1:
             return "1"
@@ -323,6 +306,8 @@ def mangle_type(arg, is_const=False):
             return "i64"
     elif isinstance(arg, float):
         return "fp32"
+    elif hasattr(arg, "tma_desc_cpu_ptr"):
+        return "nvTmaDesc"
     else:
         # dtypes are hashable so we can memoize this mapping:
         dsk = (arg.dtype, is_const)
@@ -387,7 +372,10 @@ def create_function_from_signature(sig, kparams):
         else:
             non_constexpr_vals.append(name)
             if not kp.do_not_specialize:
-                specialisations.append('compute_spec_key(%s)' % name)
+                if not kp.do_not_specialize_on_alignment:
+                    specialisations.append('compute_spec_key(%s, align=True)' % name)
+                else:
+                    specialisations.append('compute_spec_key(%s, align=False)' % name)
             if kp.annotation_type:
                 signature_types.append('"%s"' % kp.annotation_type)
             else:
@@ -454,6 +442,9 @@ for v in list(type_canonicalisation_dict.values()):
 class JITFunction(KernelInterface[T]):
     # Hook for inspecting compiled functions and modules
     cache_hook = None
+    # Hook to signal that a kernel is done compiling and inspect compiled function.
+    # cache_hook will always be called before compilation and compiled_hook after.
+    compiled_hook = None
     divisibility = 16
 
     @staticmethod
@@ -499,7 +490,7 @@ class JITFunction(KernelInterface[T]):
         divisible_by_16 = {
             param.num
             for param, arg in zip(self.params, args)
-            if is_divisible_by_16(arg) and not param.do_not_specialize
+            if is_divisible_by_16(arg) and not param.do_not_specialize and not param.do_not_specialize_on_alignment
         }
         equal_to_1 = {
             param.num
@@ -537,8 +528,11 @@ class JITFunction(KernelInterface[T]):
         constants,
         options,
         configs,
+        is_warmup,
+        before,
     ):
-        if JITFunction.cache_hook is None:
+        hook = JITFunction.cache_hook if before else JITFunction.compiled_hook
+        if hook is None:
             return False
 
         name = self.fn.__name__
@@ -567,14 +561,15 @@ class JITFunction(KernelInterface[T]):
             'extern_libs': options.extern_libs,
             'configs': configs,
             'specialization_data': specialization_data,
+            'is_warmup': is_warmup,
         }
 
-        return JITFunction.cache_hook(
+        return hook(
             key=key,
             repr=repr,
             fn=JitFunctionInfo(module, name, self),
             compile={"key": key, **kwargs},
-            is_manual_warmup=False,
+            is_manual_warmup=is_warmup,
             already_compiled=False,
         )
 
@@ -655,7 +650,7 @@ class JITFunction(KernelInterface[T]):
                 if callable(arg):
                     raise TypeError(f"Callable constexpr at index {i} is not supported")
 
-            if self._call_hook(key, signature, device, constants, options, configs):
+            if self._call_hook(key, signature, device, constants, options, configs, warmup, before=True):
                 return None
             # compile the kernel
             src = self.ASTSource(self, signature, constants, configs[0])
@@ -665,10 +660,11 @@ class JITFunction(KernelInterface[T]):
                 options=options.__dict__,
             )
             self.cache[device][key] = kernel
+            self._call_hook(key, signature, device, constants, options, configs, warmup, before=False)
 
         # Check that used global values have not changed.
         not_present = object()
-        for (name, globals_dict_id), (val, globals_dict) in self.used_global_vals.items():
+        for (name, _), (val, globals_dict) in self.used_global_vals.items():
             if (newVal := globals_dict.get(name, not_present)) != val:
                 raise RuntimeError(
                     f"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}")
@@ -692,15 +688,17 @@ class JITFunction(KernelInterface[T]):
                        self.CompiledKernel.launch_enter_hook, self.CompiledKernel.launch_exit_hook, *non_constexpr_vals)
         return kernel
 
-    def __init__(self, fn, version=None, do_not_specialize=None, debug=None, noinline=None, repr=None,
-                 launch_metadata=None):
+    def __init__(self, fn, version=None, do_not_specialize=None, do_not_specialize_on_alignment=None, debug=None,
+                 noinline=None, repr=None, launch_metadata=None):
         do_not_specialize = do_not_specialize if do_not_specialize else []
+        do_not_specialize_on_alignment = do_not_specialize_on_alignment if do_not_specialize_on_alignment else []
 
         self.fn = fn
         self.module = fn.__module__
         self.version = version
         self.signature = inspect.signature(fn)
         self.do_not_specialize = do_not_specialize
+        self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
         self.starting_line_number = inspect.getsourcelines(fn)[1]
         self.repr = lambda _: fn.__name__ if repr is None else repr(_)
         self.launch_metadata = launch_metadata
@@ -709,8 +707,9 @@ class JITFunction(KernelInterface[T]):
 
         self.params = []
         for i, param in enumerate(self.signature.parameters.values()):
-            dns = do_not_specialize and (i in do_not_specialize or param.name in do_not_specialize)
-            self.params.append(KernelParam(i, param, dns))
+            dns = i in do_not_specialize or param.name in do_not_specialize
+            dns_oa = i in do_not_specialize_on_alignment or param.name in do_not_specialize_on_alignment
+            self.params.append(KernelParam(i, param, dns, dns_oa))
 
         # function source code (without decorators)
         self.src = textwrap.dedent(inspect.getsource(fn))
@@ -828,6 +827,7 @@ def jit(
     repr: Optional[Callable] = None,
     launch_metadata: Optional[Callable] = None,
     do_not_specialize: Optional[Iterable[int]] = None,
+    do_not_specialize_on_alignment: Optional[Iterable[int]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
 ) -> Callable[[T], JITFunction[T]]:
@@ -841,6 +841,7 @@ def jit(
     repr: Optional[Callable] = None,
     launch_metadata: Optional[Callable] = None,
     do_not_specialize: Optional[Iterable[int]] = None,
+    do_not_specialize_on_alignment: Optional[Iterable[int]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
 ) -> Union[JITFunction[T], Callable[[T], JITFunction[T]]]:
@@ -866,12 +867,15 @@ def jit(
         assert callable(fn)
         if os.getenv("TRITON_INTERPRET", "0") == "1":
             from .interpreter import InterpretedFunction
-            return InterpretedFunction(fn)
+            return InterpretedFunction(fn, version=version, do_not_specialize=do_not_specialize,
+                                       do_not_specialize_on_alignment=do_not_specialize_on_alignment, debug=debug,
+                                       noinline=noinline, repr=repr, launch_metadata=launch_metadata)
         else:
             return JITFunction(
                 fn,
                 version=version,
                 do_not_specialize=do_not_specialize,
+                do_not_specialize_on_alignment=do_not_specialize_on_alignment,
                 debug=debug,
                 noinline=noinline,
                 repr=repr,
@@ -954,3 +958,21 @@ def reinterpret(tensor, dtype):
         return TensorWrapper(tensor, dtype)
     else:
         raise TypeError(f"Cannot reinterpret a {type(tensor)}.")
+
+
+def get_jit_fn_file_line(fn):
+    base_fn = fn
+    while not isinstance(base_fn, JITFunction):
+        base_fn = base_fn.fn
+    file_name = base_fn.fn.__code__.co_filename
+    lines, begin_line = inspect.getsourcelines(base_fn.fn)
+    # Match the following pattern:
+    # @triton.autotune(...) <- foo.__code__.co_firstlineno
+    # @triton.heuristics(...)
+    # @triton.jit
+    # def foo(...): <- this line is the first line
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("def "):
+            begin_line += idx
+            break
+    return file_name, begin_line

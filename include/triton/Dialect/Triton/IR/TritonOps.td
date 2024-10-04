@@ -221,6 +221,8 @@ def TT_AdvanceOp : TT_Op<"advance",
     let results = (outs TT_TensorPtr:$result);
 
     let assemblyFormat = "$ptr `,` `[` $offsets `]` attr-dict `:` type($result)";
+
+    let hasFolder = 1;
 }
 
 //
@@ -490,6 +492,7 @@ def TT_BroadcastOp : TT_Op<"broadcast", [Pure,
 
     let hasCanonicalizeMethod = 1;
     let hasFolder = 1;
+    let hasVerifier = 1;
 }
 
 // cat is not `pure` because it may reorder elements
@@ -625,6 +628,7 @@ def TT_GetNumProgramsOp : TT_Op<"get_num_programs", [Pure]> {
 //
 def TT_DotOp : TT_Op<"dot", [Pure,
                              DeclareOpInterfaceMethods<InferTypeOpInterface>,
+                             DotLike,
                              TypesMatchWith<"result's type matches accumulator's type",
                                             "d", "c", "$_self">]> {
     let summary = "dot";
@@ -640,8 +644,8 @@ def TT_DotOp : TT_Op<"dot", [Pure,
 
     let arguments = (
       ins
-      TT_TensorOrMemDesc:$a,
-      TT_TensorOrMemDesc:$b,
+      TT_FpIntTensor:$a,
+      TT_FpIntTensor:$b,
       TT_FpIntTensor:$c,
       DefaultValuedAttr<TT_InputPrecisionAttr, "::mlir::triton::InputPrecision::IEEE">:$inputPrecision,
       DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc
@@ -816,8 +820,14 @@ def TT_HistogramOp : TT_Op<"histogram", [Pure]> {
 //
 // Print Op
 //
-def TT_PrintOp : TT_Op<"print", [MemoryEffects<[MemWrite<GlobalMemory>]>]>,
-  Arguments<(ins StrAttr:$prefix, BoolAttr:$hex, Variadic<AnyTypeOf<[TT_Type]>>:$args)> {
+def TT_PrintOp : TT_Op<"print", [SameVariadicOperandSize, MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let arguments = (
+    ins
+    StrAttr:$prefix,
+    BoolAttr:$hex,
+    Variadic<AnyTypeOf<[TT_Type]>>:$args,
+    DenseI32ArrayAttr:$isSigned
+  );
   let summary = "Device-side print, as in CUDA for debugging";
   let description = [{
     `tt.print` takes a literal string prefix and an arbitrary number of scalar or tensor arguments that should be printed.
@@ -849,7 +859,7 @@ def TT_MakeTensorPtrOp : TT_Op<"make_tensor_ptr",
                                 SameVariadicOperandSize,
                                 TypesMatchWith<"infer pointer type from the result type",
                                                "result", "base",
-                                               "getPointerType(getElementTypeOfTensorPointerType($_self))">]> {
+                                               "getPointerType(getElementTypeOfTensorPointerType($_self), getAddressSpace($_self))">]> {
   let summary = "Make a tensor pointer type with meta information of the parent tensor and the block specified";
 
   let description = [{

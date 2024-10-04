@@ -22,10 +22,17 @@ namespace AMD {
 std::unique_ptr<OperationPass<ModuleOp>>
 createDecomposeUnsupportedConversionsPass(StringRef targetArch);
 
+/// @brief Creates pass that keep LDS consumption within specified limits.
+/// @param arch target architecture name, for example "gfx940"
+/// @param customLDSLimit defines LDS size available for one thread block
+/// zero value tells pass that whole LDS is available on a device
+/// @return created pass
+std::unique_ptr<OperationPass<ModuleOp>>
+createOptimizeLDSUsagePass(StringRef arch, int32_t customLDSLimit = 0);
 } // namespace AMD
 
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertTritonAMDGPUToLLVMPass(StringRef targetArch);
+createConvertTritonAMDGPUToLLVMPass(StringRef targetArch, bool ftz);
 std::unique_ptr<OperationPass<ModuleOp>> createConvertBuiltinFuncToLLVMPass();
 
 #define GEN_PASS_REGISTRATION

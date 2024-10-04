@@ -70,16 +70,24 @@ Type MemDescType::parse(AsmParser &parser) {
       return Type();
   }
   bool mutableMemory = false;
+  Attribute memorySpace;
   if (succeeded(parser.parseOptionalComma())) {
+    if (failed(parser.parseOptionalKeyword(kMutableMemory))) {
+      if (parser.parseAttribute(memorySpace))
+        return Type();
+    } else {
+      mutableMemory = true;
+    }
+  }
+  if (mutableMemory == false && succeeded(parser.parseOptionalComma())) {
     if (parser.parseOptionalKeyword(kMutableMemory))
       return Type();
     mutableMemory = true;
   }
   if (parser.parseGreater())
     return Type();
-
   return MemDescType::get(parser.getContext(), dimensions, elementType,
-                          encoding, mutableMemory);
+                          encoding, memorySpace, mutableMemory);
 }
 
 void MemDescType::print(AsmPrinter &printer) const {
@@ -89,6 +97,8 @@ void MemDescType::print(AsmPrinter &printer) const {
   printer << getElementType();
   if (getEncoding())
     printer << ", " << getEncoding();
+  if (getMemorySpace())
+    printer << ", " << getMemorySpace();
   if (getMutableMemory())
     printer << ", " << kMutableMemory;
   printer << ">";
@@ -147,7 +157,16 @@ Type getPointerTypeSameShape(Type type) {
   }
 }
 
-Type getPointerType(Type type) { return PointerType::get(type, 1); }
+// upstream Triton only uses address space 1 for Pointer Type
+Type getPointerType(Type type, int addressSpace) {
+  return PointerType::get(type, addressSpace);
+}
+
+int getAddressSpace(Type type) {
+  if (auto ptrType = dyn_cast<PointerType>(type))
+    return ptrType.getAddressSpace();
+  return 1;
+}
 
 bool isTensorPointerType(Type type) {
   if (auto ptrType = dyn_cast<PointerType>(type))

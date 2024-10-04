@@ -84,6 +84,7 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
 ]> {
   let summary = "copy data from global memory to local memory asynchronously";
 
+  let hasVerifier = 1;
   let description = [{
     This operation copies data from global memory to local memory asynchronously.
     This is analogue to tt.load except the data are copied to local memory pointed
@@ -144,9 +145,17 @@ def TTG_LocalAllocOp : TTG_Op<"local_alloc", [DeclareOpInterfaceMethods<MemoryEf
   }];
   let arguments = (ins Optional<TT_Tensor>:$src);
 
+  let extraClassDeclaration = [{
+    bool isSharedMemoryAlloc() {
+      return getType().getMemorySpace() &&
+             isa<SharedMemorySpaceAttr>(getType().getMemorySpace());
+    }
+  }];
   let assemblyFormat = [{$src attr-dict `:` functional-type(operands, results)}];
 
   let results = (outs TT_MemDescType:$result);
+  let hasFolder = 1;
+  let hasVerifier = 1;
 }
 
 // Deallocate shared memory
@@ -163,7 +172,7 @@ def TTG_LocalDeallocOp : TTG_Op<"local_dealloc", [MemoryEffects<[MemFree<SharedM
 
     Because we assume a memdesc is dead at the first point that post-dominates
     its uses, ops that wait for an async operation on a memdesc to complete
-    (such as triton_nvidia_gpu.dot_wait) should also take the memdesc as an
+    (such as triton_nvidia_gpu.warp_group_dot_wait) should also take the memdesc as an
     operand.
   }];
 
@@ -226,6 +235,7 @@ def TTG_LocalStoreOp : TTG_Op<"local_store", [DeclareOpInterfaceMethods<MemoryEf
   }];
   let arguments = (ins TT_Tensor:$src, TT_MemDescType:$dst);
 
+  let hasVerifier = 1;
   // Use qualified() otherwise "!tt.memdesc<X>" is printed as "<X>".
   let assemblyFormat = [{
     $src `,` $dst attr-dict `:` type($src) `->` qualified(type($dst))

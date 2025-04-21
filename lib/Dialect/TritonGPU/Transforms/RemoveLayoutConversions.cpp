@@ -706,7 +706,6 @@ Operation *LayoutPropagation::rewriteOp(Operation *op) {
     auto newType = RankedTensorType::get(tensorType.getShape(),
                                          tensorType.getElementType(), encoding);
     auto cvt = rewriter.create<ConvertLayoutOp>(op->getLoc(), newType, src);
-    cvt->setAttrs(op->getAttrs());
     map(op->getResult(0), cvt.getResult());
     return cvt.getOperation();
   }
@@ -1293,7 +1292,6 @@ void LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
   auto newConvertOp = builder.create<ConvertLayoutOp>(
       convertOp.getLoc(), newType, extOrBroadcastOp->getOperand(0));
   Operation *newExtOrBroadcast = builder.clone(*extOrBroadcastOp);
-  newConvertOp->setAttrs(convertOp->getAttrs());
   newExtOrBroadcast->setOperand(0, newConvertOp.getResult());
   auto oldExtOrBroadcastType =
       cast<RankedTensorType>(extOrBroadcastOp->getResult(0).getType());

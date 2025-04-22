@@ -86,10 +86,10 @@ void processProducerAcquireOp(OpBuilder &builder, ttng::ProducerAcquireOp op,
 }
 
 void processProducerCommitOp(OpBuilder &builder, ttng::ProducerCommitOp op,
-                             Value bufferFull, ttng::TokenLoadType loadType) {
+                             Value bufferFull, ttng::TokenLoadType loadType,
+                             unsigned fullCnt) {
   auto loc = op.getLoc();
-  int txCnt = 0;
-  ttng::MBarrierArriveOp arriveOp;
+  ttng::ArriveBarrierOp arriveOp;
 
   if (loadType == ttng::TokenLoadType::TMALoadOp) {
     // Only thread 0 arrives for TMA load.
@@ -97,15 +97,20 @@ void processProducerCommitOp(OpBuilder &builder, ttng::ProducerCommitOp op,
     Value threadId = createThreadIdOp(builder, loc);
     Value pred = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
                                                threadId, _0);
-    arriveOp = builder.create<ttng::MBarrierArriveOp>(
-        loc, bufferFull, pred, /*remoteCTAId*/ nullptr, /*trackAsyncOp*/ false,
-        txCnt);
+    // Get the count from the barriers: trace the local_alloc for the barrier
+    // then find the count from init_barrier
+    arriveOp =
+        builder.create<ttng::ArriveBarrierOp>(loc, bufferFull, fullCnt, pred);
   } else {
+#if 0
     // Each thread arrives.
     Value pred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
     arriveOp = builder.create<ttng::MBarrierArriveOp>(
         loc, bufferFull, pred, /*remoteCTAId*/ nullptr, /*trackAsyncOp*/ true,
         txCnt);
+#else
+    assert(false);
+#endif
   }
 
   assert(op.getOperation()->hasAttr("async_task_id"));
@@ -124,10 +129,11 @@ void processConsumerWaitOp(OpBuilder &builder, ttng::ConsumerWaitOp op,
 }
 
 void processConsumerReleaseOp(OpBuilder &builder, ttng::ConsumerReleaseOp op,
-                              Value bufferEmpty, int numCTAs) {
+                              Value bufferEmpty, int numCTAs,
+                              unsigned emptyCnt) {
   auto loc = op.getLoc();
-  auto arriveOp = builder.create<ttng::MBarrierArriveOp>(
-      loc, bufferEmpty, nullptr, nullptr, false, 0);
+  auto arriveOp =
+      builder.create<ttng::ArriveBarrierOp>(loc, bufferEmpty, emptyCnt);
   assert(op.getOperation()->hasAttr("async_task_id"));
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
 }
@@ -167,19 +173,22 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     tokenToFull[createTokenOp.getOperation()] = bufferFullArray;
     tokenToEmpty[createTokenOp.getOperation()] = bufferEmptyArray;
 
+    unsigned bufferFullCount =
+        loadType == ttng::TokenLoadType::TMALoadOp ? 1 : THREADS_PER_TASK;
+    unsigned bufferEmptyCount = THREADS_PER_TASK;
     for (unsigned i = 0; i < createTokenOp.getNum(); i++) {
       Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
       Value barrierFullView = builder.create<ttg::MemDescSubviewOp>(
           loc, singleBarrierMemDescType, bufferFullArray, idx);
-      unsigned bufferFullCount =
-          loadType == ttng::TokenLoadType::TMALoadOp ? 1 : THREADS_PER_TASK;
+      // EmptyView is used for ConsumerRelease and ProducerAcquire.
+      // FullView is for ConsumerWait and ProducerCommit.
       builder.create<ttng::InitBarrierOp>(loc, barrierFullView,
                                           bufferFullCount);
 
       Value barrierEmptyView = builder.create<ttg::MemDescSubviewOp>(
           loc, singleBarrierMemDescType, bufferEmptyArray, idx);
       builder.create<ttng::InitBarrierOp>(loc, barrierEmptyView,
-                                          THREADS_PER_TASK);
+                                          bufferEmptyCount);
     }
 
     assert(numCTAs == 1 && "remote CTA is not supported yet");
@@ -212,7 +221,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         Value bufferFull = extractBufferFull(loc, op.getIdx());
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
-        processProducerCommitOp(builder, op, bufferFull, loadType);
+        processProducerCommitOp(builder, op, bufferFull, loadType,
+                                bufferFullCount);
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::ConsumerWaitOp>(user)) {
@@ -226,7 +236,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
         assert(user->hasAttr("async_task_id"));
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
-        processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs);
+        processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
+                                 bufferEmptyCount);
         deprecatedOps.push_back(user);
         return true;
       }

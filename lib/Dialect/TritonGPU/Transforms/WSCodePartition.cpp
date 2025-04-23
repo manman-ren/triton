@@ -62,9 +62,16 @@ unsigned getNumBuffersOrDefault(scf::ForOp forOp, unsigned numBuffers) {
       .getInt();
 }
 
+static bool hasAsyncTaskId(Operation *op, SmallVector<AsyncTaskId> &taskList) {
+  for (auto tId : taskList)
+    if (hasAsyncTaskId(op, tId))
+      return true;
+  return false;
+}
+
 // Collect argument indices that are used by the specific taskId.
-static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
-                                                     int asyncTaskId) {
+static SmallVector<unsigned>
+collectBlockArgsForTask(scf::ForOp forOp, SmallVector<AsyncTaskId> taskList) {
 
   // Collect argument indices that can be reached along the definition chain.
   SetVector<unsigned> argIndices;
@@ -72,7 +79,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
       [&](scf::ForOp nestedForOp, Value arg, unsigned argIdx) {
         for (auto user : arg.getUsers()) {
           // Skip ops that are not in the same async task
-          if (!hasAsyncTaskId(user, asyncTaskId))
+          if (!hasAsyncTaskId(user, taskList))
             continue;
 
           if (isa<scf::YieldOp>(user)) {
@@ -83,7 +90,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
                 auto initArg =
                     nestedForOp.getInitArgs()[blockArg.getArgNumber() - 1];
                 if (Operation *def = initArg.getDefiningOp()) {
-                  if (hasAsyncTaskId(def, asyncTaskId)) {
+                  if (hasAsyncTaskId(def, taskList)) {
                     argIndices.insert(argIdx);
                     return;
                   }
@@ -104,7 +111,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
               auto initArg =
                   nestedForOp.getInitArgs()[blockArg.getArgNumber() - 1];
               if (Operation *def = initArg.getDefiningOp()) {
-                if (hasAsyncTaskId(def, asyncTaskId)) {
+                if (hasAsyncTaskId(def, taskList)) {
                   argIndices.insert(argIdx);
                   return;
                 }
@@ -162,7 +169,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
 
 Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
-                        AsyncTaskId asyncTaskId);
+                        SmallVector<AsyncTaskId> taskList); // asyncTaskId);
 
 // Check to see if op is enclosed under ifOp.
 static bool enclosing(scf::IfOp ifOp, Operation *op) {
@@ -752,7 +759,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, unsigned numBuffers,
 
 Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
                           OpBuilderWithAsyncTaskIds &builder,
-                          AsyncTaskId asyncTaskId) {
+                          SmallVector<AsyncTaskId> taskList) { // asyncTaskId) {
   LLVM_DEBUG({
     LDBG("specialize ifOp ");
     ifOp.dump();
@@ -769,7 +776,7 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
     for (Value yieldV : ifOp.thenYield().getOperands()) {
       // Check the defining op for the corresponding result.
       if (Operation *def = yieldV.getDefiningOp()) {
-        bool hasTaskId = hasAsyncTaskId(def, asyncTaskId);
+        bool hasTaskId = hasAsyncTaskId(def, taskList); // asyncTaskId);
         if (hasTaskId) {
           keptResultVec.push_back(resultIdx);
         }
@@ -782,7 +789,7 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
           // track initial value
           auto initArg = forOp.getInitArgs()[bbArg.getArgNumber() - 1];
           if (Operation *def = initArg.getDefiningOp()) {
-            if (hasAsyncTaskId(def, asyncTaskId))
+            if (hasAsyncTaskId(def, taskList)) // asyncTaskId))
               keptResultVec.push_back(resultIdx);
           } else {
             llvm_unreachable("Initial value should have a defining op");
@@ -804,12 +811,12 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
       ifOp.elseBlock());
 
   OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
-  ifBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+  ifBuilder.setAsynTaskIdsFromArray(taskList); //{asyncTaskId});
 
   // Handle thenRegion of this IfOp.
   ifBuilder.setInsertionPointToEnd(newIfOp.thenBlock());
   for (Operation &thenOp : ifOp.thenBlock()->getOperations()) {
-    SpecializeOp(&thenOp, mapping, ifBuilder, asyncTaskId);
+    SpecializeOp(&thenOp, mapping, ifBuilder, taskList); // asyncTaskId);
   }
 
   // Update yields
@@ -830,7 +837,7 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   if (ifOp.elseBlock()) {
     ifBuilder.setInsertionPointToEnd(newIfOp.elseBlock());
     for (Operation &elseOp : ifOp.elseBlock()->getOperations()) {
-      SpecializeOp(&elseOp, mapping, ifBuilder, asyncTaskId);
+      SpecializeOp(&elseOp, mapping, ifBuilder, taskList); // asyncTaskId);
     }
     if (keptResultVec.size() < ifOp->getResultTypes().size()) {
       SmallVector<Value> elseYieldOperands;
@@ -849,11 +856,12 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   return newIfOp;
 }
 
-Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
-                           OpBuilderWithAsyncTaskIds &builder,
-                           AsyncTaskId asyncTaskId) {
+Operation *
+SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
+                OpBuilderWithAsyncTaskIds &builder,
+                SmallVector<AsyncTaskId> taskList) { // asyncTaskId) {
   // Create newForOp for each task Id.
-  auto usedArgs = collectBlockArgsForTask(forOp, asyncTaskId);
+  auto usedArgs = collectBlockArgsForTask(forOp, taskList); // asyncTaskId);
 
   // Prepare newLoopArgs.
   SmallVector<Value> newLoopArgs;
@@ -885,10 +893,10 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
 
   // Recursively clone all operations with this asyncTaskId to newForOp.
   OpBuilderWithAsyncTaskIds forBuilder(forOp.getContext());
-  forBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+  forBuilder.setAsynTaskIdsFromArray(taskList); //{asyncTaskId});
   forBuilder.setInsertionPointToStart(newForOp.getBody());
   for (Operation &op : forOp.getBody()->without_terminator()) {
-    SpecializeOp(&op, mapping, forBuilder, asyncTaskId);
+    SpecializeOp(&op, mapping, forBuilder, taskList); // asyncTaskId);
   }
 
   // Create YieldOp for newForOp.
@@ -902,14 +910,14 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
     auto initialYield =
         llvm::cast<scf::YieldOp>(newForOp.getBody()->getTerminator());
     if (newYieldOperands.size() == 0) {
-      setAsyncTaskIds(initialYield, {asyncTaskId});
+      setAsyncTaskIds(initialYield, taskList); //{asyncTaskId});
       createNewYield = false;
     }
   }
   if (createNewYield) {
     auto newYieldOp =
         forBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
-    setAsyncTaskIds(newYieldOp, {asyncTaskId});
+    setAsyncTaskIds(newYieldOp, taskList); //{asyncTaskId});
   }
 
   // Replace results of forOp with results of newForOp.
@@ -924,29 +932,31 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
 
 Operation *SpecializeOp(Operation *op, IRMapping &mapping,
                         OpBuilderWithAsyncTaskIds &builder,
-                        AsyncTaskId asyncTaskId) {
+                        SmallVector<AsyncTaskId> taskList) { // asyncTaskId) {
   auto taskIds = getAsyncTaskIds(op);
   // yieldOp are sometimes implict, meaning they do not necessarily have a task
   // id, but they should be shared by all async tasks.
-  if (!hasAsyncTaskId(op, asyncTaskId) && !isa<scf::YieldOp>(op))
+  if (!hasAsyncTaskId(op, taskList /*asyncTaskId*/) && !isa<scf::YieldOp>(op))
     return nullptr;
 
   if (op->getNumRegions() == 0) {
     Operation *newOp = builder.clone(*op, mapping);
-    setAsyncTaskIds(newOp, asyncTaskId);
+    setAsyncTaskIds(newOp, taskList); // asyncTaskId);
     for (unsigned i = 0; i < op->getNumResults(); ++i)
       mapping.map(op->getResult(i), newOp->getResult(i));
     return newOp;
   } else {
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-      return SpecializeIfOp(ifOp, mapping, builder, asyncTaskId);
+      return SpecializeIfOp(ifOp, mapping, builder, taskList); // asyncTaskId);
     } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      return SpecializeForOp(forOp, mapping, builder, asyncTaskId);
+      return SpecializeForOp(forOp, mapping, builder,
+                             taskList); // asyncTaskId);
     } else if (auto reduceOp = dyn_cast<ReduceOp>(op)) {
       Operation *newOp = builder.clone(*op, mapping);
       // recursively set async task ids for child ops
-      newOp->walk(
-          [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
+      newOp->walk([&](Operation *childOp) {
+        setAsyncTaskIds(childOp, taskList /*asyncTaskId*/);
+      });
       for (unsigned i = 0; i < op->getNumResults(); ++i)
         mapping.map(op->getResult(i), newOp->getResult(i));
       return newOp;
@@ -958,10 +968,101 @@ Operation *SpecializeOp(Operation *op, IRMapping &mapping,
   return nullptr;
 }
 
+static void isOpMMaTask(Operation *op, AsyncTaskId asyncTaskId,
+                        bool &hasGen5MMa, bool &hasOtherTensorOp) {
+  hasGen5MMa = false;
+  hasOtherTensorOp = false;
+  if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    for (Operation &op2 : forOp.getBody()->without_terminator()) {
+      bool hasGen5MMaTmp;
+      isOpMMaTask(&op2, asyncTaskId, hasGen5MMaTmp, hasOtherTensorOp);
+      if (hasGen5MMaTmp)
+        hasGen5MMa = true;
+    }
+    return;
+  }
+  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    for (Operation &thenOp : ifOp.thenBlock()->getOperations()) {
+      bool hasGen5MMaTmp;
+      isOpMMaTask(&thenOp, asyncTaskId, hasGen5MMaTmp, hasOtherTensorOp);
+      if (hasGen5MMaTmp)
+        hasGen5MMa = true;
+    }
+
+    if (ifOp.elseBlock()) {
+      for (Operation &elseOp : ifOp.elseBlock()->getOperations()) {
+        bool hasGen5MMaTmp;
+        isOpMMaTask(&elseOp, asyncTaskId, hasGen5MMaTmp, hasOtherTensorOp);
+        if (hasGen5MMaTmp)
+          hasGen5MMa = true;
+      }
+    }
+    return;
+  }
+  if (dyn_cast<MakeRangeOp>(op) || isa<arith::ConstantOp>(op))
+    return;
+  if (!hasAsyncTaskId(op, asyncTaskId))
+    return;
+  if (isa<nvidia_gpu::TCGen5MMAOp>(op)) {
+    hasGen5MMa = true;
+    return;
+  }
+
+  for (int i = 0; i < op->getNumResults(); ++i) {
+    if (auto tensorType =
+            dyn_cast<RankedTensorType>(op->getResult(i).getType())) {
+      LLVM_DEBUG({
+        LDBG("groupTasksToRegion: hit a tensor type for task " << asyncTaskId);
+        op->dump();
+      });
+      hasOtherTensorOp = true;
+      break;
+    }
+  }
+}
+
+static void groupTasksToRegion(
+    triton::FuncOp funcOp, SmallVector<Operation *> &opList,
+    DenseMap<AsyncTaskId, SmallVector<AsyncTaskId>> &tasksToRegion,
+    DenseMap<AsyncTaskId, unsigned> &numWarpsForTask) {
+  // By default each taskId has its own group.
+  DenseSet<AsyncTaskId> mmaTasks;
+  // Assume a single region for mma tasks, the key taskId is mmaTaskId.
+  AsyncTaskId mmaTaskId;
+  for (AsyncTaskId asyncTaskId : getNestedAsyncTaskIds(funcOp)) {
+    // Mark a task as MMA only.
+    bool hasGen5MMa = false;
+    bool hasOtherTensorOp = false;
+    for (Operation *op : opList) {
+      bool hasGen5MMaTmp;
+      isOpMMaTask(op, asyncTaskId, hasGen5MMaTmp, hasOtherTensorOp);
+      if (hasGen5MMaTmp)
+        hasGen5MMa = true;
+      if (hasOtherTensorOp)
+        break;
+    }
+    if (!hasOtherTensorOp && hasGen5MMa) {
+      if (mmaTasks.empty())
+        mmaTaskId = asyncTaskId;
+      mmaTasks.insert(asyncTaskId);
+      LDBG("groupTasksToRegion: task " << asyncTaskId << " is gen5 mma task");
+    }
+  }
+  // Merge all mmaTasks in one group.
+  for (AsyncTaskId asyncTaskId : getNestedAsyncTaskIds(funcOp)) {
+    if (!mmaTasks.count(asyncTaskId)) {
+      tasksToRegion[asyncTaskId].push_back(asyncTaskId);
+      numWarpsForTask[asyncTaskId] = 4; // FIXME: hard-code to 4
+    } else {
+      tasksToRegion[mmaTaskId].push_back(asyncTaskId);
+      numWarpsForTask[asyncTaskId] = 1;
+    }
+  }
+}
+
 // Create IfOp for each ayncTaskId.
-DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
-                                                  int regDecProducer,
-                                                  int regIncConsumer) {
+void SpecializeRegion(triton::FuncOp funcOp, int regDecProducer,
+                      int regIncConsumer) {
 
   LLVM_DEBUG({
     LDBG("\n\n");
@@ -993,6 +1094,7 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
   Block *lastBlock = &funcOp.getBody().back();
   auto returnOp = llvm::cast<triton::ReturnOp>(lastBlock->getTerminator());
   builder.setInsertionPoint(returnOp);
+#if 0
   Value curAsyncTaskId = builder.create<ttng::GetAsyncTaskIdOp>(loc);
 
   // Instead of a new IfOp for each task, we create one partitionRegion.
@@ -1010,6 +1112,31 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
                                             nTaskIds.size() - 1);
   // Put producer wg in default.
   DenseMap<AsyncTaskId, scf::IfOp> tasksToIfOp;
+#endif
+  // Simple heuristics to merge tasks to one region.
+  DenseMap<AsyncTaskId, SmallVector<AsyncTaskId>> tasksToRegion;
+  DenseMap<AsyncTaskId, unsigned> numWarpsForTask; // task to number of warps
+  groupTasksToRegion(funcOp, opList, tasksToRegion, numWarpsForTask);
+  SmallVector<AsyncTaskId> keySorted;
+  for (auto &kv : tasksToRegion) {
+    keySorted.push_back(kv.first);
+  }
+  std::sort(keySorted.begin(), keySorted.end());
+
+  // For New Lowering.
+  // Instead of a new IfOp for each task region, we create one partitionRegion.
+  SmallVector<int32_t> partitionNumWarps;
+  for (AsyncTaskId keyId : keySorted) {
+    if (keyId == 0) {
+      continue; // the default region
+    }
+    partitionNumWarps.push_back(numWarpsForTask[keyId]);
+  }
+  ArrayRef<Type> dummyTypes;
+  ImplicitLocOpBuilder impB(opList[0]->getLoc(), opList[0]);
+  impB.setInsertionPoint(returnOp);
+  auto wsOp = impB.create<WarpSpecializeOp>(dummyTypes, partitionNumWarps,
+                                            keySorted.size() - 1);
 
   // Clone all operations into the corresponding if blocks. If the operation
   // has multiple taskIds, it will be cloned for multiple if blocks.
@@ -1017,14 +1144,14 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
   // body with the right asyncTaskId, instead of cloning the IfOp.
   // Handle producer WG.
   {
-    AsyncTaskId asyncTaskId = nTaskIds[0];
     OpBuilderWithAsyncTaskIds taskBuilder(context);
-    taskBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+    auto &taskList = tasksToRegion[keySorted[0]];
+    taskBuilder.setAsynTaskIdsFromArray(taskList);
     Block *defaultBlock = impB.createBlock(&wsOp.getDefaultRegion());
     taskBuilder.setInsertionPointToStart(defaultBlock);
     IRMapping mapping;
     for (Operation *op : opList) {
-      SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
+      SpecializeOp(op, mapping, taskBuilder, taskList);
     }
     SmallVector<Value> opnds;
     taskBuilder.create<WarpYieldOp>(loc, opnds);
@@ -1032,33 +1159,17 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
 
   unsigned idx = 1;
   for (Region *region : wsOp.getPartitionRegions()) {
-    AsyncTaskId asyncTaskId = nTaskIds[idx];
-#if 0
-    // Create IfOp for each asyncTaskId.
-    Value cond = builder.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::eq, curAsyncTaskId,
-        builder.create<arith::ConstantIntOp>(loc, asyncTaskId, 32));
-
-    auto ifOp = builder.create<scf::IfOp>(loc, cond);
-    tasksToIfOp[asyncTaskId] = ifOp;
-    setAsyncTaskIds(ifOp, {asyncTaskId});
-#endif
+    auto &taskList = tasksToRegion[keySorted[idx]];
     OpBuilderWithAsyncTaskIds taskBuilder(context);
-    taskBuilder.setAsynTaskIdsFromArray({asyncTaskId});
-#if 0
-    // Set insertion point before yieldOp.
-    auto yieldOp = ifOp.thenYield();
-    setAsyncTaskIds(yieldOp, {asyncTaskId});
-    taskBuilder.setInsertionPoint(yieldOp);
-#endif
-    LDBG("region idx " << idx << " " << nTaskIds.size());
+    taskBuilder.setAsynTaskIdsFromArray(taskList);
+
     ++idx;
     Block *partitionBlock = impB.createBlock(region);
     taskBuilder.setInsertionPointToStart(partitionBlock);
 
     IRMapping mapping;
     for (Operation *op : opList) {
-      SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
+      SpecializeOp(op, mapping, taskBuilder, taskList);
     }
     taskBuilder.create<WarpReturnOp>(loc);
   }
@@ -1138,7 +1249,6 @@ DenseMap<AsyncTaskId, scf::IfOp> SpecializeRegion(triton::FuncOp funcOp,
     }
     op->erase();
   }
-  return tasksToIfOp;
 }
 
 enum class DataChannelKind { SMEM, TMEM };
@@ -3433,6 +3543,11 @@ void foldLocalLoads(triton::FuncOp funcOp) {
     if (auto src = localAlloc.getSrc()) {
       if (auto localLoad = dyn_cast<ttg::LocalLoadOp>(src.getDefiningOp())) {
         // Only fold within the same tasks
+        LLVM_DEBUG({
+          LDBG("\nfoldLocalLoads check taskId:");
+          localAlloc->dump();
+          localLoad->dump();
+        });
         if (getAsyncTaskIds(localLoad) == getAsyncTaskIds(localAlloc)) {
           opsToReplace[localAlloc] = localLoad.getSrc();
         }
@@ -3440,8 +3555,25 @@ void foldLocalLoads(triton::FuncOp funcOp) {
     }
   });
   OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
-  for (auto kv : opsToReplace)
+  for (auto kv : opsToReplace) {
+    LLVM_DEBUG({
+      LDBG("\nreplaceUsesAndPropagateType:");
+      kv.getFirst()->dump();
+      kv.getSecond().dump();
+    });
     replaceUsesAndPropagateType(builder, kv.getFirst(), kv.getSecond());
+    auto localAlloc = cast<ttg::LocalAllocOp>(kv.getFirst());
+    auto localLoad =
+        cast<ttg::LocalLoadOp>(localAlloc.getSrc().getDefiningOp());
+    if (localAlloc.getResult().use_empty()) {
+      LDBG("-- erase localAlloc");
+      localAlloc.erase();
+    }
+    if (localLoad.getResult().use_empty()) {
+      LDBG("-- erase localLoad");
+      localLoad.erase();
+    }
+  }
 }
 
 class TritonGPUWSCodePartitionPass
@@ -3558,7 +3690,7 @@ public:
       funcOp.dump();
     });
 
-    auto ret = SpecializeRegion(funcOp, regDecProducer, regIncConsumer);
+    SpecializeRegion(funcOp, regDecProducer, regIncConsumer);
     LLVM_DEBUG({
       LDBG("\n\nwith SpecializeRegion");
       funcOp.dump();

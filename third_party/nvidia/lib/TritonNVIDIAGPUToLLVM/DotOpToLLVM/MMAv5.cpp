@@ -367,7 +367,7 @@ void convertDotImpl(const LLVMTypeConverter &typeConverter,
                     Value b, Value loadedA, Value loadedB,
                     MemDescType dTensorTy, Value useDFlag, Value pred,
                     ValueRange barriers, ValueRange barrierPreds, bool twoCTAs,
-                    const DotConversion &op, Operation *dot) {
+                    const DotConversion &op) {
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
 
   // Only run mma on one thread. We currently use elect as ptxas is not able to
@@ -519,7 +519,7 @@ void convertDot(const LLVMTypeConverter &typeConverter,
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
-                 adaptor.getBarrierPreds(), twoCTAs, dot, op);
+                 adaptor.getBarrierPreds(), twoCTAs, dot);
 }
 
 int64_t getFormatBitSize(ScaleDotElemType type) {
@@ -632,7 +632,7 @@ void convertScaledDot(const LLVMTypeConverter &typeConverter,
   convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
                  adaptor.getA(), adaptor.getB(), dTensorTy, adaptor.getUseD(),
                  adaptor.getPred(), adaptor.getBarriers(),
-                 adaptor.getBarrierPreds(), /*twoCTAs=*/false, dot, op);
+                 adaptor.getBarrierPreds(), /*twoCTAs=*/false, dot);
 }
 
 //===----------------------------------------------------------------------===//

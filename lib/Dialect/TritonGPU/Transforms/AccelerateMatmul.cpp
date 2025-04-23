@@ -19,7 +19,6 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Support/Debug.h"
 
 namespace mlir {
 namespace triton {
@@ -549,7 +548,7 @@ public:
         loc, accMemDescType, cvtAcc);
     auto vTrue = rewriter.create<arith::ConstantIntOp>(dotOp.getLoc(), 1, 1);
     auto mma = rewriter.create<triton::nvidia_gpu::TCGen5MMAOp>(
-        loc, a, b, acc, vTrue, vTrue, Value(), UnitAttr());
+        loc, a, b, acc, /*useD=*/vTrue, /*pred=*/vTrue);
     mma.setTwoCtas(useTwoCTAs);
 
     auto ld =

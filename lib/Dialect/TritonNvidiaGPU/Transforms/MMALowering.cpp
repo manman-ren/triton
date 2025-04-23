@@ -41,8 +41,8 @@ public:
     Value barrierAlloc =
         rewriter.create<LocalAllocOp>(loc, barrierMemDescType, Value());
     rewriter.create<InitBarrierOp>(loc, barrierAlloc, 1);
-    op.addCompletionBarrier(
-        barrierAlloc, taskIdRewriter.create<arith::ConstantIntOp>(loc, 1, 1));
+    op.addCompletionBarrier(barrierAlloc,
+                            rewriter.create<arith::ConstantIntOp>(loc, 1, 1));
 
     rewriter.setInsertionPointAfter(op);
     Value phase = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);

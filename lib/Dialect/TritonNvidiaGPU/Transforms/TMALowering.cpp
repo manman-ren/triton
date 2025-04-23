@@ -7,6 +7,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
@@ -111,6 +112,7 @@ public:
 
   LogicalResult matchAndRewrite(DescriptorLoadOp op,
                                 PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
     auto createLoad = [&](Value tmaPtr, Value barrierAlloc, Value alloc,
                           Value pred) {
       auto indices = translateTMAIndices(
@@ -138,7 +140,7 @@ struct TMAGatherLowering : public OpRewritePattern<DescriptorGatherOp> {
     lowerTMALoad(op, op.getType(), op.getDesc(), createLoad, rewriter);
     return success();
   }
-}; // namespace
+};
 
 static void lowerTMAStore(Operation *op, mlir::TypedValue<RankedTensorType> src,
                           Value desc,
@@ -177,7 +179,7 @@ struct TMAStoreLowering : public OpRewritePattern<DescriptorStoreOp> {
     lowerTMAStore(op, op.getSrc(), op.getDesc(), createStore, rewriter);
     return success();
   }
-}; // namespace
+};
 
 struct TMAScatterLowering : public OpRewritePattern<DescriptorScatterOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -191,7 +193,7 @@ struct TMAScatterLowering : public OpRewritePattern<DescriptorScatterOp> {
     lowerTMAStore(op, op.getSrc(), op.getDesc(), createStore, rewriter);
     return success();
   }
-}; // namespace
+};
 
 class TMACreateDescLowering : public OpRewritePattern<MakeTensorDescOp> {
 public:

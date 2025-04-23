@@ -707,6 +707,24 @@ def matmul_ws_cooperative_set_block_size_hook(nargs):
 
 def matmul_tma_ws_cooperative_get_configs(pre_hook=None):
     return [
+        #triton.Config(
+        #    {
+        #        "BLOCK_SIZE_M": 128,
+        #        "BLOCK_SIZE_N": 256,
+        #        "BLOCK_SIZE_K": 64,
+        #        "GROUP_SIZE_M": 8,
+        #        "FIRST_MMA_CONSUMER": 1,
+        #        "LAST_MMA_CONSUMER": 1,
+        #        "FIRST_EPILOG_CONSUMER": 2,
+        #        "LAST_EPILOG_CONSUMER": 2,
+        #        "EPILOGUE_SUBTILE": True,
+        #    },
+        #    num_stages=2,
+        #    num_warps=4,
+        #    num_consumer_groups=2,
+        #    num_buffers_warp_spec=4,
+        #    pre_hook=pre_hook,
+        #),
         triton.Config(
             {
                 "BLOCK_SIZE_M": 128,
@@ -716,60 +734,6 @@ def matmul_tma_ws_cooperative_get_configs(pre_hook=None):
                 "FIRST_MMA_CONSUMER": 1,
                 "LAST_MMA_CONSUMER": 1,
                 "FIRST_EPILOG_CONSUMER": 2,
-                "LAST_EPILOG_CONSUMER": 2,
-                "EPILOGUE_SUBTILE": True,
-            },
-            num_stages=2,
-            num_warps=4,
-            num_consumer_groups=2,
-            num_buffers_warp_spec=4,
-            pre_hook=pre_hook,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "FIRST_MMA_CONSUMER": 1,
-                "LAST_MMA_CONSUMER": 1,
-                "FIRST_EPILOG_CONSUMER": 2,
-                "LAST_EPILOG_CONSUMER": 2,
-                "EPILOGUE_SUBTILE": False,
-            },
-            num_stages=2,
-            num_warps=4,
-            num_consumer_groups=2,
-            num_buffers_warp_spec=3,
-            pre_hook=pre_hook,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "FIRST_MMA_CONSUMER": 1,
-                "LAST_MMA_CONSUMER": 1,
-                "FIRST_EPILOG_CONSUMER": 1,
-                "LAST_EPILOG_CONSUMER": 1,
-                "EPILOGUE_SUBTILE": True,
-            },
-            num_stages=2,
-            num_warps=4,
-            num_consumer_groups=1,
-            num_buffers_warp_spec=4,
-            pre_hook=pre_hook,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 8,
-                "FIRST_MMA_CONSUMER": 1,
-                "LAST_MMA_CONSUMER": 2,
-                "FIRST_EPILOG_CONSUMER": 1,
                 "LAST_EPILOG_CONSUMER": 2,
                 "EPILOGUE_SUBTILE": False,
             },
@@ -870,10 +834,10 @@ def matmul_kernel_persistent_tma_ws_cooperative(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
-            with tl.async_task([0]):
+            if True: #with tl.async_task([0]):
                 a = a_desc.load([offs_am, offs_k])
                 b = b_desc.load([offs_bn, offs_k])
-            with tl.async_task([FIRST_MMA_CONSUMER, LAST_MMA_CONSUMER]):
+            if True: #with tl.async_task([FIRST_MMA_CONSUMER, LAST_MMA_CONSUMER]):
                 accumulator = tl.dot(a, b.T, accumulator)
 
         tile_id_c += NUM_SMS
@@ -888,7 +852,7 @@ def matmul_kernel_persistent_tma_ws_cooperative(
         # memory to increase our stage count.
         # In this case we partition the accumulator into 2 BLOCK_SIZE_M x BLOCK_SIZE_N // 2 tensors
         if EPILOGUE_SUBTILE:
-            with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
+            if True: #with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
                 acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
                 acc = tl.permute(acc, (0, 2, 1))
                 acc0, acc1 = tl.split(acc)
@@ -897,7 +861,7 @@ def matmul_kernel_persistent_tma_ws_cooperative(
                 c1 = acc1.to(dtype)
                 c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
         else:
-            with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
+            if True: #with tl.async_task([FIRST_EPILOG_CONSUMER, LAST_EPILOG_CONSUMER]):
                 accumulator = accumulator.to(dtype)
                 c_desc.store([offs_am_c, offs_bn_c], accumulator)
 

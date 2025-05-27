@@ -1,11 +1,13 @@
 add_triton_library(TritonGPUTransforms
   AccelerateMatmul.cpp
+  BufferReuse.cpp
   Coalesce.cpp
   F32DotTC.cpp
   FuseNestedLoops.cpp
   CombineTensorSelectAndIf.cpp
   DecomposeScaledBlocked.cpp
   HoistTMEMAlloc.cpp
+  LoopCSE.cpp
   ReduceDataDuplication.cpp
   OptimizeAccumulatorInit.cpp
   OptimizeDotOperands.cpp

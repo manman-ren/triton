@@ -924,11 +924,11 @@ except BaseException:
 
 TORCH_HAS_FP8 = False
 # Meta 2 configs
-# 8, 16, 8096, 128
+# 8, 16, 8192, 128
 # 1024, 4, 1024, 128
 #BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
-BATCH, N_HEADS, HEAD_DIM = 8, 16, 128
-#BATCH, N_HEADS, HEAD_DIM = 1024, 4, 128
+#BATCH, N_HEADS, HEAD_DIM = 8, 16, 128
+BATCH, N_HEADS, HEAD_DIM = 1024, 4, 128
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd"]:
@@ -939,7 +939,7 @@ for mode in ["fwd"]:
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
-                    x_vals=[8*1024], #16*1024],
+                    x_vals=[1024], #8*1024], #16*1024],
                     line_arg="provider",
                     line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
                     (["flash"] if HAS_FLASH else []),

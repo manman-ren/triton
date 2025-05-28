@@ -923,18 +923,23 @@ except BaseException:
     HAS_FLASH = False
 
 TORCH_HAS_FP8 = False
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
+# Meta 2 configs
+# 8, 16, 8096, 128
+# 1024, 4, 1024, 128
+#BATCH, N_HEADS, HEAD_DIM = 4, 32, 128
+BATCH, N_HEADS, HEAD_DIM = 8, 16, 128
+#BATCH, N_HEADS, HEAD_DIM = 1024, 4, 128
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd"]:
-    for causal in [True]:
+    for causal in [False]:
         for warp_specialize in [True]:
             if mode == "bwd" and not causal:
                 continue
             configs.append(
                 triton.testing.Benchmark(
                     x_names=["N_CTX"],
-                    x_vals=[16*1024],
+                    x_vals=[8*1024], #16*1024],
                     line_arg="provider",
                     line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
                     (["flash"] if HAS_FLASH else []),

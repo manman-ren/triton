@@ -86,6 +86,18 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_fuse_nested_loops", createTritonGPUFuseNestedLoops);
   ADD_PASS_WRAPPER_0("add_coalesce_async_copy",
                      createTritonGPUCoalesceAsyncCopy);
+#if 0
+  // Meta's autoWS
+  ADD_PASS_OPTION_WRAPPER_1("add_ws_task_partition",
+                            createTritonGPUWSTaskPartition, int);
+  ADD_PASS_OPTION_WRAPPER_1("add_ws_data_partition",
+                            createTritonGPUWSDataPartition, int);
+  ADD_PASS_OPTION_WRAPPER_1("add_ws_lowering", createTritonGPUWSLowering, int);
+  ADD_PASS_OPTION_WRAPPER_1("add_taskid_propagate",
+                            createTritonGPUTaskIdPropagate, int);
+  ADD_PASS_OPTION_WRAPPER_4("add_ws_code_partition",
+                            createTritonGPUWSCodePartition, int, int, int, int);
+#endif
   ADD_PASS_WRAPPER_0("add_canonicalizer", createTritonGPUCanonicalize);
   ADD_PASS_WRAPPER_0("add_inliner", [] {
     return createInlinerPass(/*opPipelines=*/{}, [](OpPassManager &pm) {

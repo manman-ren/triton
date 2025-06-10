@@ -61,11 +61,19 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_lower_aref", mlir::triton::createNVWSLowerAref);
 }
 
+
+void init_triton_hopper_passes(py::module &&m) {
+  // Meta's autoWS
+  ADD_PASS_OPTION_WRAPPER_1("add_hopper_warpspec",
+                            mlir::triton::createNVGPUWarpSpecialization, int);
+}
+
 void init_triton_nvidia(py::module &&m) {
   auto passes = m.def_submodule("passes");
   init_triton_nvidia_passes_nvws(passes.def_submodule("nvws"));
   init_triton_nvidia_passes_ttgpuir(passes.def_submodule("ttgpuir"));
   init_triton_nvidia_passes_ttnvgpuir(passes.def_submodule("ttnvgpuir"));
+  init_triton_hopper_passes(passes.def_submodule("hopperws"));
 
   // cluster info
   py::class_<mlir::triton::nvidia_gpu::ClusterInfo>(m, "ClusterInfo")

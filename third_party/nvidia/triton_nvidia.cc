@@ -61,11 +61,10 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_lower_aref", mlir::triton::createNVWSLowerAref);
 }
 
-
 void init_triton_hopper_passes(py::module &&m) {
   // Meta's autoWS
   ADD_PASS_OPTION_WRAPPER_1("add_hopper_warpspec",
-                            mlir::triton::createNVGPUWarpSpecialization, int);
+                            mlir::createNVGPUWarpSpecialization, int);
 }
 
 void init_triton_nvidia(py::module &&m) {

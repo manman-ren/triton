@@ -264,7 +264,7 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm)
-            passes.hopperws.add_hopper_warpspec(pm, opt.num_consumer_groups)
+            nvidia.passes.ttnvgpuir.add_hopper_warpspec(pm, opt.num_consumer_groups)
             if opt.num_consumer_groups == 0:
                 passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:

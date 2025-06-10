@@ -23,7 +23,7 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir {
 
-int doTaskIdPropagate(triton::FuncOp funcOp) {
+int doTaskIdPropagate(triton::FuncOp &funcOp) {
   SymbolTableCollection symbolTable;
   Operation *op = funcOp.getOperation();
   DataFlowSolver solver;

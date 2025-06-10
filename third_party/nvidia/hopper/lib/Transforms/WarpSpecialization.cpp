@@ -11,10 +11,11 @@
 namespace mlir {
 
 void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups);
-int doTaskIdPropagate(triton::FuncOp funcOp);
+int doTaskIdPropagate(triton::FuncOp &funcOp);
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers,
                      unsigned requestedRegisters);
+void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
 
 #define GEN_PASS_DEF_NVGPUWARPSPECIALIZATION
 #include "nvidia/hopper/include/Transforms/Passes.h.inc"
@@ -40,6 +41,7 @@ public:
     if (!doDataPartition(funcOp, numWarpGroups - 1))
       signalPassFailure();
     doCodePartition(funcOp, 2, 0); // FIXME
+    doTokenLowering(funcOp, numWarpGroups - 1);
   }
 
   void runOnOperation() override {

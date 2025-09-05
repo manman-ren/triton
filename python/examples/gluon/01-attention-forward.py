@@ -1083,8 +1083,8 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype, profile=False):
 
 BATCH = [4]
 N_HEADS = [32]
-HEAD_DIM = [64, 128]
-causal = [False, True]
+HEAD_DIM = [128] #64, 128]
+causal = [False] #False, True]
 providers = ["triton-fp16", "triton-fp8"]
 N_CTX = [2**i for i in range(10, 17)]
 

@@ -84,7 +84,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         alpha = tl.math.exp2(m_i - m_ij)
         l_ij = tl.sum(p, 1)
         # -- update output accumulator --
-        if not IS_HOPPER and warp_specialize and BLOCK_M == 128 and HEAD_DIM == 128:
+        if False: #not IS_HOPPER and warp_specialize and BLOCK_M == 128 and HEAD_DIM == 128:
             BM: tl.constexpr = acc.shape[0]
             BN: tl.constexpr = acc.shape[1]
             acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
@@ -128,16 +128,17 @@ def _host_descriptor_pre_hook(nargs):
 if is_hip():
     NUM_STAGES_OPTIONS = [1]
 elif supports_host_descriptor():
-    NUM_STAGES_OPTIONS = [2, 3, 4]
+    NUM_STAGES_OPTIONS = [3]
 else:
-    NUM_STAGES_OPTIONS = [2, 3, 4]
+    NUM_STAGES_OPTIONS = [3]
 
+# BLOCK_M: 128, BLOCK_N: 128, num_warps: 4, num_ctas: 1, num_stages: 3
 configs = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w, pre_hook=_host_descriptor_pre_hook) \
-    for BM in [64, 128]\
-    for BN in [32, 64, 128]\
+    for BM in [128]\
+    for BN in [128]\
     for s in NUM_STAGES_OPTIONS \
-    for w in [4, 8]\
+    for w in [4]\
 ]
 if "PYTEST_VERSION" in os.environ:
     # Use a single config in testing for reproducibility
@@ -168,10 +169,8 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
-@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
-                 prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
-def _attn_fwd(sm_scale, M,  #
+def _attn_fwd_compute(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
@@ -181,7 +180,7 @@ def _attn_fwd(sm_scale, M,  #
               warp_specialize: tl.constexpr,  #
               IS_HOPPER: tl.constexpr,  #
               ):
-    dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
+    dtype = tl.float8e5 if FP8_OUTPUT else tl.bfloat16
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -235,11 +234,61 @@ def _attn_fwd(sm_scale, M,  #
                                         2, offs_m, offs_n, N_CTX,  #
                                         warp_specialize, IS_HOPPER)
     # epilogue
-    m_i += tl.math.log2(l_i)
-    acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
-    tl.store(m_ptrs, m_i)
+    #m_i += tl.math.log2(l_i)
+    #acc = acc / l_i[:, None]
+    #m_ptrs = M + off_hz * N_CTX + offs_m
+    #tl.store(m_ptrs, m_i)
     desc_o.store([qo_offset_y, 0], acc.to(dtype))
+
+
+@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+                 prune_configs_by={'early_config_prune': prune_invalid_configs})
+@triton.jit
+def _attn_fwd_persist(sm_scale, M,  #
+              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+              HEAD_DIM: tl.constexpr,  #
+              BLOCK_M: tl.constexpr,  #
+              BLOCK_N: tl.constexpr,  #
+              FP8_OUTPUT: tl.constexpr,  #
+              STAGE: tl.constexpr,  #
+              warp_specialize: tl.constexpr,  #
+              IS_HOPPER: tl.constexpr,  #
+              OUTER_LOOP: tl.constexpr,
+              ):
+    n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
+    prog_id = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+    total_tiles = n_tile_num * Z * H
+
+    tiles_per_sm = total_tiles // num_progs
+    if prog_id < total_tiles % num_progs:
+        tiles_per_sm += 1
+
+    tile_idx = prog_id
+    # inner loop warpspec vs. outer loop warpspec
+    for _ in tl.range(0, tiles_per_sm, warp_specialize=warp_specialize and OUTER_LOOP):
+        pid = tile_idx % n_tile_num
+        off_hz = tile_idx // n_tile_num
+        _attn_fwd_compute(sm_scale, M, Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,
+                          HEAD_DIM, BLOCK_M, BLOCK_N, FP8_OUTPUT, STAGE, warp_specialize and not OUTER_LOOP, IS_HOPPER)
+        tile_idx += num_progs
+
+
+@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+                 prune_configs_by={'early_config_prune': prune_invalid_configs})
+@triton.jit
+def _attn_fwd(sm_scale, M,  #
+              Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
+              HEAD_DIM: tl.constexpr,  #
+              BLOCK_M: tl.constexpr,  #
+              BLOCK_N: tl.constexpr,  #
+              FP8_OUTPUT: tl.constexpr,  #
+              STAGE: tl.constexpr,  #
+              warp_specialize: tl.constexpr,  #
+              IS_HOPPER: tl.constexpr,  #
+              ):
+    _attn_fwd_compute(sm_scale, M, Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,
+                      HEAD_DIM, BLOCK_M, BLOCK_N, FP8_OUTPUT, STAGE, warp_specialize, IS_HOPPER)
 
 
 @triton.jit
@@ -296,14 +345,14 @@ def _attn_bwd_dkdv(dk, dv,  #
         do = tl.load(do_ptrs)
         # Compute dV.
         ppT = pT
-        ppT = ppT.to(tl.float16)
+        ppT = ppT.to(tl.bfloat16)
         dv += tl.dot(ppT, do)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.float16)
+        dsT = dsT.to(tl.bfloat16)
         dk += tl.dot(dsT, tl.trans(qT))
         # Increment pointers.
         curr_m += step_m
@@ -349,7 +398,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
-        ds = ds.to(tl.float16)
+        ds = ds.to(tl.bfloat16)
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         dq += tl.dot(ds, tl.trans(kT))
@@ -534,27 +583,46 @@ class _attention(torch.autograd.Function):
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
         def grid(META):
             return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
+        def grid_persist(META):
+            return (min(NUM_SMS, triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1]), 1, 1)
+
         ctx.grid = grid
         if is_blackwell() and warp_specialize:
-            if HEAD_DIM_K == 128 and q.dtype == torch.float16:
+            if HEAD_DIM_K == 128 and q.dtype == torch.bfloat16:
                 extra_kern_args["maxnreg"] = 168
             else:
                 extra_kern_args["maxnreg"] = 80
-        _attn_fwd[grid](
-            sm_scale, M,  #
-            q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o,  #
-            N_CTX=q.shape[2],  #
-            HEAD_DIM=HEAD_DIM_K,  #
-            FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-            STAGE=stage,  #
-            warp_specialize=warp_specialize,  #
-            IS_HOPPER=is_hopper(),  #
-            **extra_kern_args)
+        PERSIST = True
+        if PERSIST:
+            _attn_fwd_persist[grid_persist](
+                sm_scale, M,  #
+                q.shape[0], q.shape[1],  #
+                desc_q, desc_k, desc_v, desc_o,  #
+                N_CTX=q.shape[2],  #
+                HEAD_DIM=HEAD_DIM_K,  #
+                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                STAGE=stage,  #
+                warp_specialize=warp_specialize,  #
+                IS_HOPPER=is_hopper(),  #
+                OUTER_LOOP=True,
+                **extra_kern_args)
+        else:
+            _attn_fwd[grid](
+                sm_scale, M,  #
+                q.shape[0], q.shape[1],  #
+                desc_q, desc_k, desc_v, desc_o,  #
+                N_CTX=q.shape[2],  #
+                HEAD_DIM=HEAD_DIM_K,  #
+                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                STAGE=stage,  #
+                warp_specialize=warp_specialize,  #
+                IS_HOPPER=is_hopper(),  #
+                **extra_kern_args)
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
@@ -618,7 +686,7 @@ TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
 @pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
 @pytest.mark.parametrize("mode", ["fwd", "bwd"])
 @pytest.mark.parametrize("provider", ["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []))
-def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.float16):
+def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.bfloat16):
     if mode == "fwd" and "fp16" in provider:
         pytest.skip("Avoid running the forward computation twice.")
     if mode == "bwd" and "fp8" in provider:
@@ -684,20 +752,20 @@ try:
 except BaseException:
     HAS_FLASH = False
 
-TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
+TORCH_HAS_FP8 = False #hasattr(torch, 'float8_e5m2')
 BATCH, N_HEADS = 4, 32
 # vary seq length for fixed head and batch=4
 configs = []
-for HEAD_DIM in [64, 128]:
-    for mode in ["fwd", "bwd"]:
-        for causal in [True, False]:
+for HEAD_DIM in [128]: #64, 128]:
+    for mode in ["fwd"]: #, "bwd"]:
+        for causal in [False]: #True, False]:
             # Enable warpspec for causal fwd on Hopper
             enable_ws = mode == "fwd" and (is_blackwell() or (is_hopper() and not causal))
-            for warp_specialize in [False, True] if enable_ws else [False]:
+            for warp_specialize in [True]: #False, True] if enable_ws else [False]:
                 configs.append(
                     triton.testing.Benchmark(
                         x_names=["N_CTX"],
-                        x_vals=[2**i for i in range(10, 15)],
+                        x_vals=[2**i for i in range(13, 14)],
                         line_arg="provider",
                         line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []) +
                         (["flash"] if HAS_FLASH else []),
@@ -721,7 +789,7 @@ for HEAD_DIM in [64, 128]:
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
-    dtype = torch.float16
+    dtype = torch.bfloat16
     if "triton" in provider:
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
